@@ -168,7 +168,10 @@ func (r *Registry) HasAvailableProviders() bool {
 	defer r.mu.RUnlock()
 
 	for _, provider := range r.providers {
-		if provider != nil && provider.IsAvailable() {
+		if provider == nil {
+			continue
+		}
+		if provider.IsAvailable() {
 			return true
 		}
 	}
