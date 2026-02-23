@@ -1926,8 +1926,25 @@ func (s *Server) handleChatMessage(msg protocol.Message, forceAgent string) prot
 		return s.errorResponse(msg.ID, "execution_error", fmt.Sprintf("Failed to execute %s: %s", agentName, err.Error()))
 	}
 
+	if resp == nil {
+		resp = &ChatResponse{
+			Content:    "",
+			Agent:      agentName,
+			TokenUsage: &ProviderTokenUsage{},
+		}
+	}
+
 	// Track token usage
-	s.addTokenUsage(resp.TokenUsage)
+	if resp.TokenUsage != nil {
+		s.addTokenUsage(resp.TokenUsage)
+	}
+
+	var inputTokens, outputTokens, totalTokens int
+	if resp.TokenUsage != nil {
+		inputTokens = resp.TokenUsage.InputTokens
+		outputTokens = resp.TokenUsage.OutputTokens
+		totalTokens = resp.TokenUsage.TotalTokens
+	}
 
 	// Return response in format compatible with both legacy and new clients
 	return protocol.Message{
@@ -1939,9 +1956,9 @@ func (s *Server) handleChatMessage(msg protocol.Message, forceAgent string) prot
 			SessionID: req.SessionID,
 			Done:      true,
 			Usage: &protocol.ChatTokenUsage{
-				InputTokens:  resp.TokenUsage.InputTokens,
-				OutputTokens: resp.TokenUsage.OutputTokens,
-				TotalTokens:  resp.TokenUsage.TotalTokens,
+				InputTokens:  inputTokens,
+				OutputTokens: outputTokens,
+				TotalTokens:  totalTokens,
 			},
 		},
 	}
