@@ -243,7 +243,8 @@ export function FeatureRequestModal({ isOpen, onClose, initialTab, initialContex
 
   const handleClose = () => {
     if (!isSubmitting) {
-      if (description.trim() !== '' && !window.confirm(t('common:common.discardUnsavedChanges', 'Discard unsaved changes?'))) {
+      const hasChanges = description.trim() !== '' || requestType !== 'bug'
+      if (hasChanges && !window.confirm(t('common:common.discardUnsavedChanges', 'Discard unsaved changes?'))) {
         return
       }
       setDescription('')

@@ -963,7 +963,8 @@ function CreateNamespaceModal({ clusters, onClose, onCreated }: CreateNamespaceM
   )
 
   const handleClose = () => {
-    if ((name.trim() !== '' || teamLabel.trim() !== '') && !window.confirm(t('common:common.discardUnsavedChanges', 'Discard unsaved changes?'))) {
+    const hasChanges = name.trim() !== '' || teamLabel.trim() !== '' || initialAccess.length > 0
+    if (hasChanges && !window.confirm(t('common:common.discardUnsavedChanges', 'Discard unsaved changes?'))) {
       return
     }
     onClose()
@@ -1244,7 +1245,8 @@ function GrantAccessModal({ namespace, existingAccess, onClose, onGranted }: Gra
   }
 
   const handleClose = () => {
-    if (subjectName.trim() !== '' && !window.confirm(t('common:common.discardUnsavedChanges', 'Discard unsaved changes?'))) {
+    const hasChanges = subjectName.trim() !== '' || subjectKind !== 'User' || subjectNS !== '' || role !== 'admin'
+    if (hasChanges && !window.confirm(t('common:common.discardUnsavedChanges', 'Discard unsaved changes?'))) {
       return
     }
     onClose()

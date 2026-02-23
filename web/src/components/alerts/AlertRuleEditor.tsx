@@ -82,7 +82,22 @@ export function AlertRuleEditor({ isOpen = true, rule, onSave, onCancel }: Alert
   const [errors, setErrors] = useState<Record<string, string>>({})
 
   const handleClose = () => {
-    const hasChanges = name.trim() !== '' || description.trim() !== ''
+    const hasChanges =
+      name.trim() !== (rule?.name || '') ||
+      description.trim() !== (rule?.description || '') ||
+      enabled !== (rule?.enabled ?? true) ||
+      severity !== (rule?.severity || 'warning') ||
+      aiDiagnose !== (rule?.aiDiagnose ?? true) ||
+      conditionType !== (rule?.condition.type || 'gpu_usage') ||
+      threshold !== (rule?.condition.threshold || 90) ||
+      duration !== (rule?.condition.duration || 60) ||
+      JSON.stringify(selectedClusters) !== JSON.stringify(rule?.condition.clusters || []) ||
+      JSON.stringify(selectedNamespaces) !== JSON.stringify(rule?.condition.namespaces || []) ||
+      weatherCondition !== (rule?.condition.weatherCondition || 'severe_storm') ||
+      temperatureThreshold !== (rule?.condition.temperatureThreshold || 100) ||
+      windSpeedThreshold !== (rule?.condition.windSpeedThreshold || 40) ||
+      JSON.stringify(channels) !== JSON.stringify(rule?.channels || [{ type: 'browser', enabled: true, config: {} }]);
+
     if (hasChanges && !window.confirm(t('common:common.discardUnsavedChanges', 'Discard unsaved changes?'))) {
       return
     }

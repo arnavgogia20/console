@@ -61,7 +61,8 @@ export function FeedbackModal({ isOpen, onClose, initialType = 'feature' }: Feed
   }
 
   const handleClose = () => {
-    if ((title.trim() !== '' || description.trim() !== '') && !window.confirm(t('common:common.discardUnsavedChanges', 'Discard unsaved changes?'))) {
+    const hasChanges = title.trim() !== '' || description.trim() !== '' || type !== initialType
+    if (hasChanges && !window.confirm(t('common:common.discardUnsavedChanges', 'Discard unsaved changes?'))) {
       return
     }
     setSuccess(false)

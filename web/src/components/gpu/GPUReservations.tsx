@@ -1334,7 +1334,19 @@ function ReservationFormModal({
   const [error, setError] = useState<string | null>(null)
 
   const handleClose = () => {
-    const hasChanges = title.trim() !== '' || description.trim() !== ''
+    const defaultStartDate = prefillDate || new Date().toISOString().split('T')[0]
+    const hasChanges =
+      title.trim() !== (editingReservation?.title || '') ||
+      description.trim() !== (editingReservation?.description || '') ||
+      cluster !== (editingReservation?.cluster || '') ||
+      namespace !== (editingReservation?.namespace || '') ||
+      gpuCount !== (editingReservation ? String(editingReservation.gpu_count) : '') ||
+      gpuPreference !== (editingReservation?.gpu_type || '') ||
+      startDate !== (editingReservation?.start_date || defaultStartDate) ||
+      durationHours !== (editingReservation ? String(editingReservation.duration_hours) : '') ||
+      notes.trim() !== (editingReservation?.notes || '') ||
+      extraResources.length > 0;
+
     if (hasChanges && !window.confirm(t('common:common.discardUnsavedChanges', 'Discard unsaved changes?'))) {
       return
     }
