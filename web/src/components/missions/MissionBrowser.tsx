@@ -16,23 +16,19 @@ import {
   ChevronDown,
   Upload,
   Download,
-  Star,
   Filter,
   Grid3X3,
   List,
-  Eye,
-  Code,
-  ArrowLeft,
   Sparkles,
   Github,
   HardDrive,
   Globe,
-  Tag,
   CheckCircle,
   Loader2,
   Plus,
   Trash2,
   ExternalLink,
+  RefreshCw,
 } from 'lucide-react'
 import { cn } from '../../lib/cn'
 import { api } from '../../lib/api'
@@ -58,6 +54,8 @@ import { ScanProgressOverlay } from './ScanProgressOverlay'
 import { CollapsibleSection } from '../ui/CollapsibleSection'
 import { InstallerCard } from './InstallerCard'
 import { SolutionCard } from './SolutionCard'
+import { MissionDetailView } from './MissionDetailView'
+import { ImproveMissionDialog } from './ImproveMissionDialog'
 import { useTranslation } from 'react-i18next'
 
 // ============================================================================
@@ -68,6 +66,8 @@ interface MissionBrowserProps {
   isOpen: boolean
   onClose: () => void
   onImport: (mission: MissionExport) => void
+  /** Deep-link: auto-select a specific mission by name (e.g. 'install-prometheus') */
+  initialMission?: string
 }
 
 interface TreeNode {
@@ -138,10 +138,142 @@ function saveWatchedPaths(paths: string[]) {
 }
 
 // ============================================================================
+// Module-level mission cache — survives dialog open/close and tab switches.
+// Fetch runs once; results are available instantly on subsequent opens.
+// ============================================================================
+interface MissionCache {
+  installers: MissionExport[]
+  solutions: MissionExport[]
+  installersFetching: boolean
+  solutionsFetching: boolean
+  installersDone: boolean
+  solutionsDone: boolean
+  listeners: Set<() => void>
+  abortController: AbortController | null
+}
+
+const missionCache: MissionCache = {
+  installers: [],
+  solutions: [],
+  installersFetching: false,
+  solutionsFetching: false,
+  installersDone: false,
+  solutionsDone: false,
+  listeners: new Set(),
+  abortController: null,
+}
+
+function notifyCacheListeners() {
+  missionCache.listeners.forEach(fn => fn())
+}
+
+async function fetchInstallersToCache() {
+  if (missionCache.installersDone || missionCache.installersFetching) return
+  missionCache.installersFetching = true
+  try {
+    const { data: entries } = await api.get<BrowseEntry[]>(
+      '/api/missions/browse?path=solutions/cncf-install'
+    )
+    const jsonFiles = entries.filter(e => e.type === 'file' && e.name.endsWith('.json'))
+
+    for (const f of jsonFiles) {
+      try {
+        const { data: content } = await api.get<string>(
+          `/api/missions/file?path=${encodeURIComponent(f.path)}`
+        )
+        const parsed = typeof content === 'string' ? JSON.parse(content) : content
+        const normalized = normalizeMission(parsed)
+        if (normalized) {
+          missionCache.installers.push(normalized)
+          notifyCacheListeners()
+        }
+      } catch { /* skip bad file */ }
+    }
+    missionCache.installersDone = true
+  } catch { /* skip */ }
+  finally {
+    missionCache.installersFetching = false
+    notifyCacheListeners()
+  }
+}
+
+async function fetchSolutionsToCache() {
+  if (missionCache.solutionsDone || missionCache.solutionsFetching) return
+  missionCache.solutionsFetching = true
+  try {
+    const { data: topEntries } = await api.get<BrowseEntry[]>(
+      '/api/missions/browse?path=solutions'
+    )
+    const dirs = topEntries.filter(e => e.type === 'directory' && e.name !== 'cncf-install')
+
+    async function collectFiles(path: string, depth: number): Promise<BrowseEntry[]> {
+      if (depth > 3) return []
+      try {
+        const { data: entries } = await api.get<BrowseEntry[]>(
+          `/api/missions/browse?path=${encodeURIComponent(path)}`
+        )
+        const files: BrowseEntry[] = []
+        for (const e of entries) {
+          if (e.type === 'file' && e.name.endsWith('.json')) {
+            files.push(e)
+          } else if (e.type === 'directory') {
+            const nested = await collectFiles(e.path, depth + 1)
+            files.push(...nested)
+          }
+        }
+        return files
+      } catch { return [] }
+    }
+
+    for (const dir of dirs) {
+      const files = await collectFiles(dir.path, 1)
+      for (const f of files) {
+        try {
+          const { data: content } = await api.get<string>(
+            `/api/missions/file?path=${encodeURIComponent(f.path)}`
+          )
+          const parsed = typeof content === 'string' ? JSON.parse(content) : content
+          const normalized = normalizeMission(parsed)
+          if (normalized && normalized.missionClass !== 'install') {
+            missionCache.solutions.push(normalized)
+            notifyCacheListeners()
+          }
+        } catch { /* skip */ }
+      }
+    }
+    missionCache.solutionsDone = true
+  } catch { /* skip */ }
+  finally {
+    missionCache.solutionsFetching = false
+    notifyCacheListeners()
+  }
+}
+
+function startMissionCacheFetch() {
+  fetchInstallersToCache()
+  fetchSolutionsToCache()
+}
+
+function resetMissionCache() {
+  missionCache.installers = []
+  missionCache.solutions = []
+  missionCache.installersDone = false
+  missionCache.solutionsDone = false
+  missionCache.installersFetching = false
+  missionCache.solutionsFetching = false
+  if (missionCache.abortController) {
+    missionCache.abortController.abort()
+    missionCache.abortController = null
+  }
+  notifyCacheListeners()
+  startMissionCacheFetch()
+}
+
+// ============================================================================
 // Component
 // ============================================================================
 
-export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProps) {
+export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: MissionBrowserProps) {
   useTranslation(['common', 'cards'])
   const { user, isAuthenticated } = useAuth()
 
@@ -176,6 +308,9 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
   const [scanResult, setScanResult] = useState<FileScanResult | null>(null)
   const [pendingImport, setPendingImport] = useState<MissionExport | null>(null)
 
+  // Improve mission dialog state
+  const [showImproveDialog, setShowImproveDialog] = useState(false)
+
   // Drag state
   const [isDragging, setIsDragging] = useState(false)
 
@@ -192,13 +327,12 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
   // Tab state
   const [activeTab, setActiveTab] = useState<BrowserTab>('recommended')
 
-  // Installer & Solution missions (fetched from KB)
-  const [installerMissions, setInstallerMissions] = useState<MissionExport[]>([])
-  const [solutionMissions, setSolutionMissions] = useState<MissionExport[]>([])
-  const [loadingInstallers, setLoadingInstallers] = useState(false)
-  const [loadingSolutions, setLoadingSolutions] = useState(false)
-  const installersFetched = useRef(false)
-  const solutionsFetched = useRef(false)
+  // Installer & Solution missions — backed by module-level cache
+  const [installerMissions, setInstallerMissions] = useState<MissionExport[]>(missionCache.installers)
+  const [solutionMissions, setSolutionMissions] = useState<MissionExport[]>(missionCache.solutions)
+  const [, forceUpdate] = useState(0)
+  const loadingInstallers = !missionCache.installersDone
+  const loadingSolutions = !missionCache.solutionsDone
   const [installerCategoryFilter, setInstallerCategoryFilter] = useState<string>('All')
   const [installerMaturityFilter, setInstallerMaturityFilter] = useState<string>('All')
   const [solutionTypeFilter, setSolutionTypeFilter] = useState<string>('All')
@@ -268,19 +402,12 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
     setSelectedPath(null)
     setSelectedMission(null)
     setDirectoryEntries([])
-    setSearchQuery('')
-    setCategoryFilter('All')
-    setCncfFilter('')
     setShowRaw(false)
     setRawContent(null)
     setScanResult(null)
     setPendingImport(null)
     setIsScanning(false)
-    setActiveTab('recommended')
-    setInstallerMissions([])
-    setSolutionMissions([])
-    installersFetched.current = false
-    solutionsFetched.current = false
+    // Preserve activeTab, searchQuery, and filter state across re-opens
   }, [isOpen, isAuthenticated, user, watchedRepos, watchedPaths])
 
   // ============================================================================
@@ -402,99 +529,70 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
   }, [isOpen])
 
   // ============================================================================
-  // Fetch installer missions (cncf-install directory)
+  // Subscribe to module-level mission cache and trigger fetch on first open
   // ============================================================================
 
   useEffect(() => {
-    if (!isOpen || activeTab !== 'installers' || installersFetched.current) return
-    installersFetched.current = true
-    let cancelled = false
+    if (!isOpen) return
 
-    async function fetchInstallers() {
-      setLoadingInstallers(true)
-      try {
-        const { data: entries } = await api.get<BrowseEntry[]>(
-          '/api/missions/browse?path=solutions/cncf-install'
-        )
-        const jsonFiles = entries.filter(e => e.type === 'file' && e.name.endsWith('.json'))
-        const missions: MissionExport[] = []
+    // Sync local state from cache immediately (covers re-open with cached data)
+    setInstallerMissions([...missionCache.installers])
+    setSolutionMissions([...missionCache.solutions])
 
-        for (const f of jsonFiles) {
-          if (cancelled) return
-          try {
-            const { data: content } = await api.get<string>(
-              `/api/missions/file?path=${encodeURIComponent(f.path)}`
-            )
-            const parsed = typeof content === 'string' ? JSON.parse(content) : content
-            const normalized = normalizeMission(parsed)
-            if (normalized) {
-              missions.push(normalized)
-              if (!cancelled) setInstallerMissions([...missions])
-            }
-          } catch { /* skip */ }
-        }
-        if (!cancelled) setInstallerMissions(missions)
-      } catch { /* skip */ }
-      finally { if (!cancelled) setLoadingInstallers(false) }
+    // Listen for incremental updates from the background fetch
+    const listener = () => {
+      setInstallerMissions([...missionCache.installers])
+      setSolutionMissions([...missionCache.solutions])
+      forceUpdate(n => n + 1)
     }
+    missionCache.listeners.add(listener)
 
-    fetchInstallers()
-    return () => { cancelled = true }
-  }, [isOpen, activeTab])
+    // Kick off fetches (no-op if already done or in progress)
+    startMissionCacheFetch()
+
+    return () => { missionCache.listeners.delete(listener) }
+  }, [isOpen])
 
   // ============================================================================
-  // Fetch solution missions (non-installer solutions)
+  // Deep-link: auto-select mission by name when initialMission is set
   // ============================================================================
 
   useEffect(() => {
-    if (!isOpen || activeTab !== 'solutions' || solutionsFetched.current) return
-    solutionsFetched.current = true
-    let cancelled = false
-
-    async function fetchSolutions() {
-      setLoadingSolutions(true)
-      try {
-        const { data: topEntries } = await api.get<BrowseEntry[]>(
-          '/api/missions/browse?path=solutions'
-        )
-        const dirs = topEntries.filter(e => e.type === 'directory' && e.name !== 'cncf-install')
-        const missions: MissionExport[] = []
-
-        for (const dir of dirs) {
-          if (cancelled) return
-          try {
-            const { data: files } = await api.get<BrowseEntry[]>(
-              `/api/missions/browse?path=${encodeURIComponent(dir.path)}`
-            )
-            for (const f of files) {
-              if (cancelled) return
-              if (f.type !== 'file' || !f.name.endsWith('.json')) continue
-              try {
-                const { data: content } = await api.get<string>(
-                  `/api/missions/file?path=${encodeURIComponent(f.path)}`
-                )
-                const parsed = typeof content === 'string' ? JSON.parse(content) : content
-                const normalized = normalizeMission(parsed)
-                if (normalized && normalized.missionClass !== 'install') {
-                  missions.push(normalized)
-                  if (!cancelled) setSolutionMissions([...missions])
-                }
-              } catch { /* skip */ }
-            }
-          } catch { /* skip */ }
-        }
-        if (!cancelled) setSolutionMissions(missions)
-      } catch { /* skip */ }
-      finally { if (!cancelled) setLoadingSolutions(false) }
+    if (!initialMission || !isOpen || selectedMission) return
+    const match = installerMissions.find(
+      (m) => m.title.toLowerCase().includes(initialMission.toLowerCase()) ||
+             (m.cncfProject && m.cncfProject.toLowerCase() === initialMission.replace('install-', '').toLowerCase())
+    )
+    if (match) {
+      setSelectedMission(match)
+      setActiveTab('installers')
+      api.get<string>(`/api/missions/browse?path=solutions/cncf-install/install-${(match.cncfProject || '').toLowerCase().replace(/[^a-z0-9]+/g, '-')}.json&raw=true`)
+        .then(({ data }) => setRawContent(typeof data === 'string' ? data : JSON.stringify(data, null, 2)))
+        .catch(() => {})
+    } else if (installerMissions.length === 0 && activeTab !== 'installers') {
+      setActiveTab('installers')
     }
-
-    fetchSolutions()
-    return () => { cancelled = true }
-  }, [isOpen, activeTab])
+  }, [initialMission, isOpen, installerMissions, selectedMission, activeTab])
 
   // ============================================================================
   // Filtered installer & solution lists
   // ============================================================================
+
+  // Effective search: local tab search overrides global search
+  const effectiveInstallerSearch = installerSearch || searchQuery
+  const effectiveSolutionSearch = solutionSearch || searchQuery
+
+  // AND search: each space-separated term must match somewhere in the mission
+  const andMatch = (text: string, query: string) => {
+    const terms = query.toLowerCase().split(/\s+/).filter(Boolean)
+    const lower = text.toLowerCase()
+    return terms.every(term => lower.includes(term))
+  }
+
+  const matchesMission = (m: MissionExport, query: string) => {
+    const haystack = [m.title, m.description, ...(m.tags || [])].join(' ')
+    return andMatch(haystack, query)
+  }
 
   const filteredInstallers = useMemo(() => {
     let list = installerMissions
@@ -504,32 +602,22 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
     if (installerMaturityFilter !== 'All') {
       list = list.filter(m => m.tags?.includes(installerMaturityFilter))
     }
-    if (installerSearch) {
-      const q = installerSearch.toLowerCase()
-      list = list.filter(m =>
-        m.title.toLowerCase().includes(q) ||
-        m.description.toLowerCase().includes(q) ||
-        m.tags?.some(t => t.toLowerCase().includes(q))
-      )
+    if (effectiveInstallerSearch) {
+      list = list.filter(m => matchesMission(m, effectiveInstallerSearch))
     }
     return list
-  }, [installerMissions, installerCategoryFilter, installerMaturityFilter, installerSearch])
+  }, [installerMissions, installerCategoryFilter, installerMaturityFilter, effectiveInstallerSearch])
 
   const filteredSolutions = useMemo(() => {
     let list = solutionMissions
     if (solutionTypeFilter !== 'All') {
       list = list.filter(m => m.type === solutionTypeFilter.toLowerCase())
     }
-    if (solutionSearch) {
-      const q = solutionSearch.toLowerCase()
-      list = list.filter(m =>
-        m.title.toLowerCase().includes(q) ||
-        m.description.toLowerCase().includes(q) ||
-        m.tags?.some(t => t.toLowerCase().includes(q))
-      )
+    if (effectiveSolutionSearch) {
+      list = list.filter(m => matchesMission(m, effectiveSolutionSearch))
     }
     return list
-  }, [solutionMissions, solutionTypeFilter, solutionSearch])
+  }, [solutionMissions, solutionTypeFilter, effectiveSolutionSearch])
 
   // ============================================================================
   // Tree expansion & lazy loading
@@ -889,7 +977,7 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search missions by name, tag, or description…"
+            placeholder={activeTab === 'installers' ? 'Search installers… (AND logic: "argo events" = argo AND events)' : activeTab === 'solutions' ? 'Search solutions…' : 'Search missions by name, tag, or description…'}
             className="w-full pl-10 pr-4 py-2 bg-secondary border border-border rounded-lg text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/40"
             autoFocus
           />
@@ -985,14 +1073,21 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
           >
             <span>{tab.icon}</span>
             {tab.label}
-            {tab.id === 'installers' && installerMissions.length > 0 && (
-              <span className="text-[10px] bg-secondary px-1.5 py-0.5 rounded-full">{installerMissions.length}</span>
+            {tab.id === 'installers' && (
+              <span className="text-[10px] bg-secondary px-1.5 py-0.5 rounded-full min-w-[28px] text-center tabular-nums">{installerMissions.length || '–'}</span>
             )}
-            {tab.id === 'solutions' && solutionMissions.length > 0 && (
-              <span className="text-[10px] bg-secondary px-1.5 py-0.5 rounded-full">{solutionMissions.length}</span>
+            {tab.id === 'solutions' && (
+              <span className="text-[10px] bg-secondary px-1.5 py-0.5 rounded-full min-w-[28px] text-center tabular-nums">{solutionMissions.length || '–'}</span>
             )}
           </button>
         ))}
+        <button
+          onClick={() => resetMissionCache()}
+          className="ml-auto inline-flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-secondary rounded transition-colors"
+          title="Refresh all mission data"
+        >
+          <RefreshCw className={cn('w-3.5 h-3.5', (!missionCache.installersDone || !missionCache.solutionsDone) && 'animate-spin')} />
+        </button>
       </div>
 
       {/* ================================================================== */}
@@ -1022,7 +1117,7 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
                   {node.id === 'github' && (
                     <button
                       onClick={(e) => { e.stopPropagation(); setAddingRepo(!addingRepo) }}
-                      className="p-1 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors flex-shrink-0"
+                      className="p-2 min-h-11 min-w-11 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors flex-shrink-0"
                       title="Add repository to watch"
                     >
                       <Plus className="w-3.5 h-3.5" />
@@ -1031,7 +1126,7 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
                   {node.id === 'local' && (
                     <button
                       onClick={(e) => { e.stopPropagation(); setAddingPath(!addingPath) }}
-                      className="p-1 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors flex-shrink-0"
+                      className="p-2 min-h-11 min-w-11 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors flex-shrink-0"
                       title="Add file path to watch"
                     >
                       <Plus className="w-3.5 h-3.5" />
@@ -1117,7 +1212,7 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
                           setWatchedRepos(updated)
                           saveWatchedRepos(updated)
                         }}
-                        className="p-1 rounded hover:bg-red-500/20 text-muted-foreground hover:text-red-400 transition-colors flex-shrink-0"
+                        className="p-2 min-h-11 min-w-11 rounded hover:bg-red-500/20 text-muted-foreground hover:text-red-400 transition-colors flex-shrink-0"
                         title="Remove from watched"
                       >
                         <Trash2 className="w-3 h-3" />
@@ -1144,7 +1239,7 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
                           setWatchedPaths(updated)
                           saveWatchedPaths(updated)
                         }}
-                        className="p-1 rounded hover:bg-red-500/20 text-muted-foreground hover:text-red-400 transition-colors flex-shrink-0"
+                        className="p-2 min-h-11 min-w-11 rounded hover:bg-red-500/20 text-muted-foreground hover:text-red-400 transition-colors flex-shrink-0"
                         title="Remove from watched"
                       >
                         <Trash2 className="w-3 h-3" />
@@ -1197,9 +1292,40 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
 
           <div className="flex-1 overflow-y-auto p-4">
             {/* ============================================================ */}
+            {/* MISSION DETAIL VIEW (renders above any tab when a mission is selected) */}
+            {/* ============================================================ */}
+            {selectedMission && (
+              <>
+                <MissionDetailView
+                  mission={selectedMission}
+                  rawContent={rawContent}
+                  showRaw={showRaw}
+                  onToggleRaw={() => setShowRaw(!showRaw)}
+                  onImport={() => handleImport(selectedMission, rawContent ?? undefined)}
+                  onBack={() => {
+                    setSelectedMission(null)
+                    setRawContent(null)
+                    setShowRaw(false)
+                  }}
+                  onImprove={selectedMission.missionClass === 'install' ? () => setShowImproveDialog(true) : undefined}
+                  matchScore={recommendations.find(
+                    (r) => r.mission.title === selectedMission.title
+                  )?.score}
+                />
+                {showImproveDialog && (
+                  <ImproveMissionDialog
+                    mission={selectedMission}
+                    isOpen={showImproveDialog}
+                    onClose={() => setShowImproveDialog(false)}
+                  />
+                )}
+              </>
+            )}
+
+            {/* ============================================================ */}
             {/* RECOMMENDED TAB (existing content) */}
             {/* ============================================================ */}
-            {activeTab === 'recommended' && (<>
+            {!selectedMission && activeTab === 'recommended' && (<>
             {/* Token / rate-limit guidance banner */}
             {tokenError && (
               <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4">
@@ -1336,24 +1462,8 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
               </div>
             )}
 
-            {/* Directory listing or Mission preview */}
-            {selectedMission ? (
-              <MissionPreview
-                mission={selectedMission}
-                rawContent={rawContent}
-                showRaw={showRaw}
-                onToggleRaw={() => setShowRaw(!showRaw)}
-                onImport={() => handleImport(selectedMission, rawContent ?? undefined)}
-                onBack={() => {
-                  setSelectedMission(null)
-                  setRawContent(null)
-                  setShowRaw(false)
-                }}
-                matchScore={recommendations.find(
-                  (r) => r.mission.title === selectedMission.title
-                )?.score}
-              />
-            ) : loading ? (
+            {/* Directory listing */}
+            {loading ? (
               <div className="flex items-center justify-center py-16">
                 <Loader2 className="w-6 h-6 text-muted-foreground animate-spin" />
               </div>
@@ -1398,7 +1508,7 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
             {/* ============================================================ */}
             {/* INSTALLERS TAB */}
             {/* ============================================================ */}
-            {activeTab === 'installers' && (
+            {!selectedMission && activeTab === 'installers' && (
               <div className="space-y-4">
                 {/* Installer filters */}
                 <div className="flex flex-wrap items-center gap-2">
@@ -1448,16 +1558,19 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
                         Loading… {installerMissions.length} found so far
                       </div>
                     )}
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+                    <div className={viewMode === 'grid'
+                      ? "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3"
+                      : "flex flex-col gap-2"
+                    }>
                       {filteredInstallers.map((mission, i) => (
                         <InstallerCard
                           key={i}
                           mission={mission}
+                          compact={viewMode === 'list'}
                           onSelect={() => {
                             setSelectedMission(mission)
                             setRawContent(JSON.stringify(mission, null, 2))
                             setShowRaw(false)
-                            setActiveTab('recommended')
                           }}
                           onImport={() => handleImport(mission)}
                         />
@@ -1478,7 +1591,7 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
             {/* ============================================================ */}
             {/* SOLUTIONS TAB */}
             {/* ============================================================ */}
-            {activeTab === 'solutions' && (
+            {!selectedMission && activeTab === 'solutions' && (
               <div className="space-y-4">
                 {/* Solution filters */}
                 <div className="flex flex-wrap items-center gap-2">
@@ -1519,16 +1632,19 @@ export function MissionBrowser({ isOpen, onClose, onImport }: MissionBrowserProp
                         Loading… {solutionMissions.length} found so far
                       </div>
                     )}
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                    <div className={viewMode === 'grid'
+                      ? "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"
+                      : "flex flex-col gap-2"
+                    }>
                       {filteredSolutions.map((mission, i) => (
                         <SolutionCard
                           key={i}
                           mission={mission}
+                          compact={viewMode === 'list'}
                           onSelect={() => {
                             setSelectedMission(mission)
                             setRawContent(JSON.stringify(mission, null, 2))
                             setShowRaw(false)
-                            setActiveTab('recommended')
                           }}
                           onImport={() => handleImport(mission)}
                         />
@@ -1749,195 +1865,6 @@ function DirectoryListing({
 }
 
 // ============================================================================
-// Mission Preview
-// ============================================================================
-
-function MissionPreview({
-  mission,
-  rawContent,
-  showRaw,
-  onToggleRaw,
-  onImport,
-  onBack,
-  matchScore,
-}: {
-  mission: MissionExport
-  rawContent: string | null
-  showRaw: boolean
-  onToggleRaw: () => void
-  onImport: () => void
-  onBack: () => void
-  matchScore?: number
-}) {
-  const typeColors: Record<string, string> = {
-    troubleshoot: 'bg-red-500/10 text-red-400 border-red-500/20',
-    deploy: 'bg-green-500/10 text-green-400 border-green-500/20',
-    upgrade: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
-    analyze: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20',
-    repair: 'bg-orange-500/10 text-orange-400 border-orange-500/20',
-    custom: 'bg-purple-500/10 text-purple-400 border-purple-500/20',
-  }
-
-  return (
-    <div className="space-y-6">
-      {/* Back button */}
-      <button
-        onClick={onBack}
-        className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
-      >
-        <ArrowLeft className="w-4 h-4" />
-        Back to listing
-      </button>
-
-      {/* Header */}
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0 flex-1">
-          <h2 className="text-xl font-semibold text-foreground">{mission.title}</h2>
-          <p className="mt-1 text-sm text-muted-foreground">{mission.description}</p>
-        </div>
-        <div className="flex items-center gap-2 flex-shrink-0">
-          {matchScore != null && matchScore > 0 && (
-            <span className="flex items-center gap-1 px-2 py-1 text-xs rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/20">
-              <Star className="w-3 h-3" />
-              {matchScore}% match
-            </span>
-          )}
-          <button
-            onClick={onToggleRaw}
-            className={cn(
-              'flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-lg border transition-colors',
-              showRaw
-                ? 'bg-secondary border-border text-foreground'
-                : 'border-border text-muted-foreground hover:text-foreground'
-            )}
-          >
-            {showRaw ? <Eye className="w-3.5 h-3.5" /> : <Code className="w-3.5 h-3.5" />}
-            {showRaw ? 'Preview' : 'View Raw'}
-          </button>
-          <button
-            onClick={onImport}
-            className="flex items-center gap-1.5 px-4 py-1.5 text-sm font-medium rounded-lg bg-purple-600 hover:bg-purple-500 text-white transition-colors"
-          >
-            <Download className="w-4 h-4" />
-            Import
-          </button>
-        </div>
-      </div>
-
-      {/* Raw view */}
-      {showRaw && rawContent ? (
-        <pre className="p-4 rounded-lg bg-secondary border border-border text-xs text-foreground font-mono overflow-x-auto max-h-[60vh] overflow-y-auto whitespace-pre-wrap">
-          {rawContent}
-        </pre>
-      ) : (
-        <>
-          {/* Badges */}
-          <div className="flex items-center flex-wrap gap-2">
-            <span
-              className={cn(
-                'px-2.5 py-1 text-xs rounded-full border',
-                typeColors[mission.type] || typeColors.custom
-              )}
-            >
-              {mission.type}
-            </span>
-            {mission.category && (
-              <span className="px-2.5 py-1 text-xs rounded-full bg-secondary text-muted-foreground border border-border">
-                {mission.category}
-              </span>
-            )}
-            {mission.cncfProject && (
-              <span className="px-2.5 py-1 text-xs rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                {mission.cncfProject}
-              </span>
-            )}
-            {mission.tags.map((tag) => (
-              <span
-                key={tag}
-                className="flex items-center gap-1 px-2 py-0.5 text-xs rounded-full bg-secondary text-muted-foreground"
-              >
-                <Tag className="w-3 h-3" />
-                {tag}
-              </span>
-            ))}
-          </div>
-
-          {/* Prerequisites */}
-          {mission.prerequisites && mission.prerequisites.length > 0 && (
-            <div>
-              <h3 className="text-sm font-medium text-foreground mb-2">Prerequisites</h3>
-              <ul className="space-y-1">
-                {mission.prerequisites.map((p, i) => (
-                  <li key={i} className="flex items-start gap-2 text-sm text-muted-foreground">
-                    <CheckCircle className="w-4 h-4 text-green-400 flex-shrink-0 mt-0.5" />
-                    {p}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          {/* Steps */}
-          {mission.steps.length > 0 && (
-            <div>
-              <h3 className="text-sm font-medium text-foreground mb-3">
-                Steps ({mission.steps.length})
-              </h3>
-              <div className="space-y-3">
-                {mission.steps.map((step, i) => (
-                  <div
-                    key={i}
-                    className="flex gap-3 p-3 rounded-lg bg-secondary/50 border border-border"
-                  >
-                    <span className="flex-shrink-0 w-6 h-6 flex items-center justify-center rounded-full bg-purple-500/20 text-purple-400 text-xs font-medium">
-                      {i + 1}
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <p className="text-sm font-medium text-foreground">{step.title}</p>
-                      <p className="text-xs text-muted-foreground mt-0.5">{step.description}</p>
-                      {step.command && (
-                        <code className="block mt-2 p-2 rounded bg-background text-xs text-foreground font-mono border border-border">
-                          {step.command}
-                        </code>
-                      )}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Resolution */}
-          {mission.resolution && (
-            <div>
-              <h3 className="text-sm font-medium text-foreground mb-2">Resolution</h3>
-              {mission.resolution.summary && (
-                <p className="text-sm text-muted-foreground mb-2">{mission.resolution.summary}</p>
-              )}
-              {mission.resolution.steps && mission.resolution.steps.length > 0 && (
-                <ul className="space-y-1 ml-2">
-                  {mission.resolution.steps.map((s, i) => (
-                    <li key={i} className="flex items-start gap-2 text-sm text-muted-foreground">
-                      <span className="text-muted-foreground/50">•</span>
-                      {s}
-                    </li>
-                  ))}
-                </ul>
-              )}
-              {mission.resolution.yaml && (
-                <pre className="mt-2 p-3 rounded-lg bg-secondary border border-border text-xs text-foreground font-mono overflow-x-auto whitespace-pre-wrap">
-                  {mission.resolution.yaml}
-                </pre>
-              )}
-            </div>
-          )}
-        </>
-      )}
-    </div>
-  )
-}
-
-// ============================================================================
 // Recommendation Card
 // ============================================================================
 
@@ -2056,7 +1983,7 @@ function normalizeMission(raw: Record<string, unknown>): MissionExport | null {
   // Already flat MissionExport
   if (raw.title && raw.type && raw.tags) return raw as unknown as MissionExport
 
-  // kc-mission-v1 nested format: { format, mission: { title, type, ... }, metadata: { tags, ... } }
+  // kc-mission-v1 nested format: { version|format, mission: { ... }, metadata: { ... } }
   const m = raw.mission as Record<string, unknown> | undefined
   if (!m) return null
 
@@ -2072,27 +1999,31 @@ function normalizeMission(raw: Record<string, unknown>): MissionExport | null {
     ?? (categoryFromTags ? categoryFromTags.charAt(0).toUpperCase() + categoryFromTags.slice(1) : undefined)
 
   const resolution = m.resolution as Record<string, unknown> | undefined
+  const sourceUrls = meta?.sourceUrls as Record<string, string> | undefined
 
   return {
-    version: (raw.format as string) ?? 'kc-mission-v1',
+    version: (raw.version as string) ?? (raw.format as string) ?? 'kc-mission-v1',
     title: (m.title as string) ?? '',
     description: (m.description as string) ?? '',
     type: (m.type as string) ?? 'troubleshoot',
     tags,
     category,
     cncfProject: cncfProjects[0] ?? undefined,
-    missionClass: (raw.missionClass as string) ?? undefined,
+    missionClass: (raw.missionClass as string) ?? ((m.type as string) === 'install' ? 'install' : undefined),
     author: (raw.author as string) ?? undefined,
     authorGithub: (raw.authorGithub as string) ?? undefined,
     difficulty: (meta?.difficulty as string) ?? undefined,
     installMethods: (meta?.installMethods as string[]) ?? undefined,
-    steps: [],
+    steps: (m.steps as MissionExport['steps']) ?? [],
+    uninstall: (m.uninstall as MissionExport['uninstall']) ?? undefined,
+    upgrade: (m.upgrade as MissionExport['upgrade']) ?? undefined,
+    troubleshooting: (m.troubleshooting as MissionExport['troubleshooting']) ?? undefined,
     resolution: resolution ? {
       summary: (resolution.summary as string) ?? '',
       steps: (resolution.steps as string[]) ?? [],
     } : undefined,
     metadata: {
-      source: (meta?.sourceIssue as string) ?? (meta?.sourceRepo as string) ?? undefined,
+      source: sourceUrls?.issue ?? sourceUrls?.source ?? (meta?.sourceIssue as string) ?? (meta?.sourceRepo as string) ?? undefined,
       createdAt: (raw.exportedAt as string) ?? undefined,
     },
   } as MissionExport
