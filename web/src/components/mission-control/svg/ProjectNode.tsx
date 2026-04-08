@@ -7,6 +7,27 @@ import { useState } from 'react'
 import { motion } from 'framer-motion'
 import { CNCF_CATEGORY_GRADIENTS } from '../../../lib/cncf-constants'
 
+/**
+ * Static project icons served from /icons/cncf/ — avoids all CORS/CSP/proxy
+ * issues by bundling avatars as static assets in web/public/.
+ */
+const STATIC_ICON_PROJECTS = new Set([
+  'prometheus', 'grafana', 'falco', 'kyverno', 'cert-manager',
+  'istio', 'helm', 'cilium', 'argocd', 'trivy', 'linkerd', 'flux',
+])
+
+function getAvatarUrl(name: string): string {
+  const key = name.toLowerCase()
+  if (STATIC_ICON_PROJECTS.has(key)) return `/icons/cncf/${key}.png`
+  // Aliases
+  if (key === 'argo-cd' || key === 'argo') return '/icons/cncf/argocd.png'
+  if (key === 'falcosecurity') return '/icons/cncf/falco.png'
+  if (key === 'fluxcd') return '/icons/cncf/flux.png'
+  if (key === 'aquasecurity') return '/icons/cncf/trivy.png'
+  // Fallback — will trigger letter fallback via onError
+  return `/icons/cncf/${key}.png`
+}
+
 type NodeStatus = 'pending' | 'running' | 'completed' | 'failed'
 
 const STATUS_COLORS: Record<NodeStatus, string> = {
@@ -14,34 +35,6 @@ const STATUS_COLORS: Record<NodeStatus, string> = {
   running: '#f59e0b',
   completed: '#22c55e',
   failed: '#ef4444',
-}
-
-/** Map project keys to GitHub org for avatar URLs */
-const PROJECT_TO_GITHUB_ORG: Record<string, string> = {
-  envoy: 'envoyproxy', argo: 'argoproj', argocd: 'argoproj',
-  'argo-cd': 'argoproj', harbor: 'goharbor', jaeger: 'jaegertracing',
-  fluentd: 'fluent', 'fluent-bit': 'fluent', vitess: 'vitessio',
-  thanos: 'thanos-io', cortex: 'cortexproject', falco: 'falcosecurity',
-  keda: 'kedacore', flux: 'fluxcd', trivy: 'aquasecurity',
-  antrea: 'antrea-io', contour: 'projectcontour',
-  'open-policy-agent': 'open-policy-agent', opa: 'open-policy-agent',
-  'open-telemetry': 'open-telemetry', opentelemetry: 'open-telemetry',
-  strimzi: 'strimzi', spiffe: 'spiffe', spire: 'spiffe',
-  'cert-manager': 'cert-manager', prometheus: 'prometheus',
-  grafana: 'grafana', istio: 'istio', linkerd: 'linkerd',
-  helm: 'helm', cilium: 'cilium', calico: 'projectcalico',
-  'kube-prometheus': 'prometheus-operator', metallb: 'metallb',
-  kyverno: 'kyverno', crossplane: 'crossplane', dapr: 'dapr',
-  knative: 'knative', nats: 'nats-io', etcd: 'etcd-io',
-  coredns: 'coredns', rook: 'rook', longhorn: 'longhorn',
-  velero: 'vmware-tanzu', 'external-secrets': 'external-secrets',
-  kubevirt: 'kubevirt', 'chaos-mesh': 'chaos-mesh',
-  keycloak: 'keycloak', 'trivy-operator': 'aquasecurity',
-  'external-secrets-operator': 'external-secrets',
-  'opa-gatekeeper': 'open-policy-agent', gatekeeper: 'open-policy-agent',
-  'cert-manager-operator': 'cert-manager',
-  'prometheus-operator': 'prometheus-operator',
-  'kube-state-metrics': 'kubernetes', alertmanager: 'prometheus',
 }
 
 export interface ProjectNodeProps {
@@ -97,12 +90,6 @@ const OVERLAY_CATEGORIES: Record<string, Set<string>> = {
   security: new Set(['Security', 'Identity & Encryption', 'Policy Enforcement', 'Runtime Security', 'Vulnerability Scanning', 'Secrets Management']),
 }
 
-function getAvatarUrl(name: string): string {
-  const key = name.toLowerCase()
-  const org = PROJECT_TO_GITHUB_ORG[key] || key
-  return `https://github.com/${org}.png?size=40`
-}
-
 export function ProjectNode({
   id,
   name,
@@ -124,13 +111,14 @@ export function ProjectNode({
   glow = false,
   dimmed = false,
   onHover,
-  onDragStart,
-  onDragEnd,
+  onDragStart: _onDragStart,
+  onDragEnd: _onDragEnd,
 }: ProjectNodeProps) {
   const [imgFailed, setImgFailed] = useState(false)
   const gradientColors = (CNCF_CATEGORY_GRADIENTS as Record<string, [string, string]>)[category]
   const primaryColor = gradientColors?.[0] ?? '#6366f1'
   const statusColor = STATUS_COLORS[status]
+  const iconSize = radius * 1.4
 
 
   const isRelevant =
@@ -139,7 +127,7 @@ export function ProjectNode({
     false
   const overlayDim = overlay === 'architecture' ? 1 : isRelevant ? 1 : 0.25
 
-  const iconSize = radius * 1.2
+  void _onDragStart; void _onDragEnd // Props preserved for API compatibility
 
   return (
     <motion.g
@@ -207,13 +195,6 @@ export function ProjectNode({
         height={iconSize}
       >
         <div
-          draggable={!!onDragStart}
-          onDragStart={(e) => {
-            e.dataTransfer.setData('text/plain', name)
-            e.dataTransfer.effectAllowed = 'move'
-            onDragStart?.(name)
-          }}
-          onDragEnd={() => onDragEnd?.()}
           style={{
             width: iconSize,
             height: iconSize,
@@ -222,7 +203,7 @@ export function ProjectNode({
             justifyContent: 'center',
             borderRadius: '50%',
             overflow: 'hidden',
-            cursor: onDragStart ? 'grab' : 'pointer',
+            cursor: 'pointer',
           }}
         >
           {!imgFailed ? (
@@ -271,8 +252,8 @@ export function ProjectNode({
         />
       )}
 
-      {/* Name label — only shown when this node is glowing, placed above to avoid edge labels */}
-      {glow && (() => {
+      {/* Name label — shown on hover (glow) or when completed so project names are always visible */}
+      {(glow || status === 'completed') && (() => {
         const shortName = name.length <= 16 ? name : name.replace(/-/g, ' ')
         const labelW = shortName.length * 3 + 6
         const labelY = cy - radius - 8

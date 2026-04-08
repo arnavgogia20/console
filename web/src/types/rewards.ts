@@ -11,6 +11,7 @@ export type RewardActionType =
   | 'daily_login'        // 10 coins
   | 'complete_onboarding' // 100 coins
   | 'first_card_add'     // 25 coins
+  | 'nps_survey'         // 50 coins
 
 export interface RewardAction {
   type: RewardActionType
@@ -101,6 +102,12 @@ export const REWARD_ACTIONS: Record<RewardActionType, RewardAction> = {
     label: 'First Card',
     description: 'Add your first card to a dashboard',
     oneTime: true,
+  },
+  nps_survey: {
+    type: 'nps_survey',
+    coins: 50,
+    label: 'NPS Survey',
+    description: 'Complete the satisfaction survey',
   },
 }
 
@@ -277,20 +284,20 @@ export const CONTRIBUTOR_LEVELS: ContributorLevel[] = [
     name: 'Captain',
     icon: 'Star',
     minCoins: 50000,
-    color: 'yellow',
-    bgClass: 'bg-yellow-500/20',
-    textClass: 'text-yellow-400',
-    borderClass: 'border-yellow-500/30',
+    color: 'orange',
+    bgClass: 'bg-orange-500/20',
+    textClass: 'text-orange-400',
+    borderClass: 'border-orange-500/30',
   },
   {
     rank: 7,
     name: 'Admiral',
     icon: 'Crown',
     minCoins: 150000,
-    color: 'orange',
-    bgClass: 'bg-orange-500/20',
-    textClass: 'text-orange-400',
-    borderClass: 'border-orange-500/30',
+    color: 'red',
+    bgClass: 'bg-red-500/20',
+    textClass: 'text-red-400',
+    borderClass: 'border-red-500/30',
   },
   {
     rank: 8,
@@ -298,9 +305,9 @@ export const CONTRIBUTOR_LEVELS: ContributorLevel[] = [
     icon: 'Sparkles',
     minCoins: 500000,
     color: 'yellow',
-    bgClass: 'bg-gradient-to-r from-yellow-500/20 via-yellow-500/20 to-orange-500/20',
-    textClass: 'text-yellow-400',
-    borderClass: 'border-yellow-500/40',
+    bgClass: 'bg-gradient-to-r from-yellow-400/30 via-amber-300/30 to-yellow-500/30',
+    textClass: 'text-yellow-300',
+    borderClass: 'border-yellow-400/50',
   },
 ]
 

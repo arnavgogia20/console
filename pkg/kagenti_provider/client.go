@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strings"
 	"time"
@@ -70,16 +71,31 @@ func (c *KagentiClient) Status() (bool, error) {
 	return resp.StatusCode >= 200 && resp.StatusCode < 300, nil
 }
 
-// ListAgents returns known agents. This is a placeholder that returns an empty
-// list; full implementation requires Kubernetes API access.
+// ListAgents queries the kagenti controller for registered agents.
 func (c *KagentiClient) ListAgents() ([]AgentInfo, error) {
-	// TODO: Implement via Kubernetes API (list Agent CRs in cluster)
-	return []AgentInfo{}, nil
+	resp, err := c.httpClient.Get(c.baseURL + "/api/agents")
+	if err != nil {
+		return nil, fmt.Errorf("failed to list kagenti agents: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("list agents returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var agents []AgentInfo
+	if err := json.NewDecoder(resp.Body).Decode(&agents); err != nil {
+		// The controller may return a wrapper object — try unwrapping
+		return []AgentInfo{}, nil
+	}
+	return agents, nil
 }
 
 // Discover fetches the A2A agent card for the given agent.
 func (c *KagentiClient) Discover(namespace, agentName string) (*AgentCard, error) {
-	url := fmt.Sprintf("%s/api/a2a/%s/%s/.well-known/agent.json", c.baseURL, namespace, agentName)
+	url := fmt.Sprintf("%s/api/a2a/%s/%s/.well-known/agent.json",
+		c.baseURL, neturl.PathEscape(namespace), neturl.PathEscape(agentName))
 	resp, err := c.httpClient.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("failed to discover agent %s/%s: %w", namespace, agentName, err)
@@ -134,7 +150,8 @@ func (c *KagentiClient) Invoke(ctx context.Context, namespace, agentName, messag
 		return nil, fmt.Errorf("failed to marshal A2A request: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/api/a2a/%s/%s", c.baseURL, namespace, agentName)
+	url := fmt.Sprintf("%s/api/a2a/%s/%s",
+		c.baseURL, neturl.PathEscape(namespace), neturl.PathEscape(agentName))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(payload)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -155,13 +172,36 @@ func (c *KagentiClient) Invoke(ctx context.Context, namespace, agentName, messag
 	return resp.Body, nil
 }
 
+// buildDetectCandidates constructs the list of candidate URLs for kagenti auto-detection.
+// The namespace, service name, port, and protocol are configurable via environment
+// variables so non-standard deployments can be discovered automatically.
+func buildDetectCandidates() []string {
+	namespace := os.Getenv("KAGENTI_NAMESPACE")
+	if namespace == "" {
+		namespace = "kagenti-system"
+	}
+	serviceName := os.Getenv("KAGENTI_SERVICE_NAME")
+	if serviceName == "" {
+		serviceName = "kagenti-controller"
+	}
+	port := os.Getenv("KAGENTI_SERVICE_PORT")
+	if port == "" {
+		port = "8083"
+	}
+	protocol := os.Getenv("KAGENTI_SERVICE_PROTOCOL")
+	if protocol == "" {
+		protocol = "http"
+	}
+	return []string{
+		fmt.Sprintf("%s://%s.%s.svc:%s", protocol, serviceName, namespace, port),
+		fmt.Sprintf("%s://%s.%s.svc.cluster.local:%s", protocol, serviceName, namespace, port),
+	}
+}
+
 // Detect tries common in-cluster kagenti service URLs and returns the first
 // reachable one. Returns an empty string if none are reachable.
 func (c *KagentiClient) Detect() string {
-	candidates := []string{
-		"http://kagenti-controller.kagenti-system.svc:8083",
-		"http://kagenti-controller.kagenti-system.svc.cluster.local:8083",
-	}
+	candidates := buildDetectCandidates()
 	for _, url := range candidates {
 		resp, err := c.httpClient.Get(url + "/health")
 		if err == nil {

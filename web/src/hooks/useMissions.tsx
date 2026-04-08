@@ -2,6 +2,7 @@ import { createContext, useContext, useState, useRef, useEffect, ReactNode } fro
 import type { AgentInfo, AgentsListPayload, AgentSelectedPayload, ChatStreamPayload } from '../types/agent'
 import { AgentCapabilityToolExec } from '../types/agent'
 import { getDemoMode } from './useDemoMode'
+import { DEMO_MISSIONS } from '../mocks/demoMissions'
 import { addCategoryTokens, setActiveTokenCategory } from './useTokenUsage'
 import { detectIssueSignature, findSimilarResolutionsStandalone, generateResolutionPromptContext } from './useResolutions'
 import { LOCAL_AGENT_WS_URL, LOCAL_AGENT_HTTP_URL } from '../lib/constants'
@@ -34,7 +35,7 @@ export interface Mission {
   id: string
   title: string
   description: string
-  type: 'upgrade' | 'troubleshoot' | 'analyze' | 'deploy' | 'repair' | 'custom'
+  type: 'upgrade' | 'troubleshoot' | 'analyze' | 'deploy' | 'repair' | 'custom' | 'maintain'
   status: MissionStatus
   progress?: number
   cluster?: string
@@ -132,6 +133,8 @@ interface SaveMissionParams {
   steps?: Array<{ title: string; description: string }>
   tags?: string[]
   initialPrompt: string
+  /** Optional context (e.g. orbitConfig) stored on the mission */
+  context?: Record<string, unknown>
 }
 
 /** Fields that can be updated on a saved (not-yet-run) mission */
@@ -187,12 +190,27 @@ const MISSION_INACTIVITY_TIMEOUT_MS = 90_000 // 90 seconds of stream silence
  */
 const CANCEL_ACK_TIMEOUT_MS = 10_000 // 10 seconds
 
+/** Pre-converted demo missions for demo mode — showcases all mission types */
+const DEMO_MISSIONS_AS_MISSIONS: Mission[] = DEMO_MISSIONS.map(m => ({
+  ...m,
+  type: m.type as Mission['type'],
+  status: m.status as Mission['status'],
+}))
+
 // Load missions from localStorage
 function loadMissions(): Mission[] {
   try {
     const stored = localStorage.getItem(MISSIONS_STORAGE_KEY)
     if (stored) {
       const parsed = JSON.parse(stored)
+      // In demo mode, replace stale demo data with fresh demo missions
+      // (catches both empty arrays and outdated demo entries without steps)
+      if (getDemoMode() && Array.isArray(parsed) && (
+        parsed.length === 0 ||
+        parsed.some((m: { id?: string }) => m.id?.startsWith('demo-'))
+      )) {
+        return DEMO_MISSIONS_AS_MISSIONS
+      }
       // Convert date strings back to Date objects
       // Mark running missions for auto-reconnection instead of failing them
       return parsed.map((m: Mission) => {
@@ -235,6 +253,12 @@ function loadMissions(): Mission[] {
   } catch (e) {
     console.error('Failed to load missions from localStorage:', e)
   }
+
+  // In demo mode, seed with orbit demo missions so the feature is visible
+  if (getDemoMode()) {
+    return DEMO_MISSIONS_AS_MISSIONS
+  }
+
   return []
 }
 
@@ -813,6 +837,9 @@ Install the console locally with the KubeStellar Console agent to use AI mission
           progress?: number
           tokens?: { input?: number; output?: number; total?: number }
         }
+        // Reset inactivity timer — progress events prove the agent is alive,
+        // even during long-running tool calls like `drasi init` (#5360).
+        lastStreamTimestamp.current.set(missionId, Date.now())
         // Track token delta for category usage
         if (payload.tokens?.total) {
           const previousTotal = m.tokenUsage?.total ?? 0
@@ -1420,6 +1447,7 @@ Install the console locally with the KubeStellar Console agent to use AI mission
       messages: [],
       createdAt: new Date(),
       updatedAt: new Date(),
+      context: params.context,
       importedFrom: {
         title: params.title,
         description: params.description,

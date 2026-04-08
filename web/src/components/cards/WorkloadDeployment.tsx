@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useEffect } from 'react'
+import { useState, useMemo, useRef, useEffect, useCallback } from 'react'
 import { useDraggable } from '@dnd-kit/core'
 import {
   Box,
@@ -7,10 +7,10 @@ import {
   XCircle,
   AlertTriangle,
   Layers,
+  Plus,
   Server,
   Database,
   Gauge,
-  Plus,
   Minus,
   GripVertical,
   Loader2,
@@ -29,6 +29,7 @@ import { useTranslation } from 'react-i18next'
 import { isAgentUnavailable } from '../../hooks/useLocalAgent'
 import { LOCAL_AGENT_HTTP_URL, MCP_HOOK_TIMEOUT_MS } from '../../lib/constants'
 import { clusterCacheRef } from '../../hooks/mcp/shared'
+import { WorkloadImportDialog } from './WorkloadImportDialog'
 
 // Workload types
 type WorkloadType = 'Deployment' | 'StatefulSet' | 'DaemonSet' | 'Job' | 'CronJob'
@@ -531,6 +532,12 @@ export function WorkloadDeployment(_props: WorkloadDeploymentProps) {
   const [typeFilter, setTypeFilter] = useState<WorkloadType | 'All'>('All')
   const [statusFilter, setStatusFilter] = useState<WorkloadStatus | 'All'>('All')
   const [selectedWorkload, setSelectedWorkload] = useState<Workload | null>(null)
+  const [showImportDialog, setShowImportDialog] = useState(false)
+  const [importedWorkloads, setImportedWorkloads] = useState<Workload[]>([])
+
+  const handleImportWorkloads = useCallback((newWorkloads: Workload[]) => {
+    setImportedWorkloads(prev => [...prev, ...newWorkloads])
+  }, [])
 
   // Manual cluster filter -- Workload has targetClusters[] not a single cluster field,
   // so we can't use useCardData's built-in clusterField filtering.
@@ -601,8 +608,8 @@ export function WorkloadDeployment(_props: WorkloadDeploymentProps) {
     return deduplicatedClusters.filter(c => c.reachable !== false)
   })()
   const workloads: Workload[] = useMemo(() => {
-    if (isDemo) return DEMO_WORKLOADS
-    if (!realWorkloads || realWorkloads.length === 0) return []
+    if (isDemo) return [...DEMO_WORKLOADS, ...importedWorkloads]
+    if (!realWorkloads || realWorkloads.length === 0) return [...importedWorkloads]
     // Transform API workloads to card format
     const mapped = realWorkloads.map((w: ApiWorkload) => {
       const clusters = w.targetClusters || (w.cluster ? [w.cluster] : [])
@@ -648,8 +655,8 @@ export function WorkloadDeployment(_props: WorkloadDeploymentProps) {
         grouped.set(key, { ...w })
       }
     }
-    return Array.from(grouped.values())
-  }, [realWorkloads, isDemo])
+    return [...Array.from(grouped.values()), ...importedWorkloads]
+  }, [realWorkloads, isDemo, importedWorkloads])
 
   // Calculate stats from actual workloads
   const stats = (() => {
@@ -772,13 +779,22 @@ export function WorkloadDeployment(_props: WorkloadDeploymentProps) {
         />
       </div>
 
-      {/* Search */}
-      <div className="px-3 mb-2">
+      {/* Search + Add — button matches input: same py-1.5, same rounded-md, same text-xs */}
+      <div className="px-3 mb-2 flex gap-2">
         <CardSearchInput
           value={search}
           onChange={setSearch}
           placeholder="Search workloads..."
+          className="!mb-0 flex-1"
         />
+        <button
+          onClick={() => setShowImportDialog(true)}
+          className="self-start px-3 py-1.5 text-xs font-medium rounded-md bg-purple-500/20 hover:bg-purple-500/30 text-purple-400 transition-colors flex items-center gap-1.5 shrink-0 whitespace-nowrap"
+          aria-label="Add workload"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          Add
+        </button>
       </div>
 
       {/* Stats bar */}
@@ -872,6 +888,13 @@ export function WorkloadDeployment(_props: WorkloadDeploymentProps) {
         itemsPerPage={typeof itemsPerPage === 'number' ? itemsPerPage : preFiltered.length}
         onPageChange={goToPage}
         needsPagination={needsPagination}
+      />
+
+      {/* Import Dialog */}
+      <WorkloadImportDialog
+        isOpen={showImportDialog}
+        onClose={() => setShowImportDialog(false)}
+        onImport={handleImportWorkloads}
       />
     </div>
   )

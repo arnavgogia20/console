@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect, lazy, Suspense } from 'react'
 import { useModalState } from '../../lib/modals'
 import { useTranslation } from 'react-i18next'
-import { User, Mail, MessageSquare, Shield, Settings, LogOut, ChevronDown, Coins, Lightbulb, Linkedin, Globe, Check, Download, Code2, ExternalLink, Rocket, KeyRound, CheckCircle2, XCircle, GitBranch } from 'lucide-react'
+import { User, Mail, MessageSquare, Shield, Settings, LogOut, ChevronDown, Coins, Lightbulb, Globe, Check, Download, Code2, ExternalLink, Rocket, KeyRound, CheckCircle2, XCircle, GitBranch } from 'lucide-react'
+import { Linkedin } from '@/lib/icons'
 import { useRewards, REWARD_ACTIONS } from '../../hooks/useRewards'
 import { getContributorLevel } from '../../types/rewards'
 import { useVersionCheck } from '../../hooks/useVersionCheck'
@@ -348,13 +349,13 @@ export function UserProfileDropdown({ user, onLogout, onPreferences }: UserProfi
           )}
 
           {/* Actions */}
-          <div className="p-2">
+          <div className="p-2 space-y-1">
             <button
               onClick={() => {
                 closeDropdown()
                 openFeedbackModal()
               }}
-              className="w-full flex items-center gap-3 px-3 py-2 text-sm text-foreground hover:bg-secondary rounded-lg transition-colors"
+              className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-foreground hover:bg-secondary rounded-lg transition-colors"
             >
               <Lightbulb className="w-4 h-4 text-yellow-500" />
               <span>{t('feedback.feedback')}</span>
@@ -362,7 +363,7 @@ export function UserProfileDropdown({ user, onLogout, onPreferences }: UserProfi
             </button>
             <button
               onClick={handleLinkedInShare}
-              className="w-full flex items-center gap-3 px-3 py-2 text-sm text-foreground hover:bg-secondary rounded-lg transition-colors"
+              className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-foreground hover:bg-secondary rounded-lg transition-colors"
             >
               <Linkedin className="w-4 h-4 text-[#0A66C2]" />
               <span>{t('feedback.shareOnLinkedIn')}</span>
@@ -373,7 +374,7 @@ export function UserProfileDropdown({ user, onLogout, onPreferences }: UserProfi
                 closeDropdown()
                 onPreferences?.()
               }}
-              className="w-full flex items-center gap-3 px-3 py-2 text-sm text-foreground hover:bg-secondary rounded-lg transition-colors"
+              className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-foreground hover:bg-secondary rounded-lg transition-colors"
             >
               <Settings className="w-4 h-4 text-muted-foreground" />
               {t('settings.title')}
@@ -387,7 +388,7 @@ export function UserProfileDropdown({ user, onLogout, onPreferences }: UserProfi
                   onLogout()
                 }
               }}
-              className={`w-full flex items-center gap-3 px-3 py-2 text-sm rounded-lg transition-colors ${
+              className={`w-full flex items-center gap-3 px-3 py-2.5 text-sm rounded-lg transition-colors ${
                 isDemoModeForced
                   ? 'text-purple-400 hover:bg-purple-950'
                   : 'text-red-400 hover:bg-red-950'

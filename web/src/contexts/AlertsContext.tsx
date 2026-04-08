@@ -424,7 +424,23 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
   // from sending repeated macOS notifications on every evaluation cycle.
   // Keys are NOT cleared on resolve — a cooldown period prevents re-notification
   // when clusters flap between reachable/unreachable states.
+  //
+  // Persisted to localStorage on every mutation to prevent duplicate
+  // notifications after page refresh (#5258). Previously keys were only
+  // saved at the end of evaluateConditions, so a refresh mid-cycle lost them.
   const notifiedAlertKeysRef = useRef<Map<string, number>>(loadNotifiedAlertKeys())
+
+  /** Set a notification dedup key and immediately persist to localStorage (#5258). */
+  const setNotifiedKey = useCallback((key: string, timestamp: number) => {
+    notifiedAlertKeysRef.current.set(key, timestamp)
+    saveNotifiedAlertKeys(notifiedAlertKeysRef.current)
+  }, [])
+
+  /** Delete a notification dedup key and immediately persist to localStorage (#5258). */
+  const deleteNotifiedKey = useCallback((key: string) => {
+    notifiedAlertKeysRef.current.delete(key)
+    saveNotifiedAlertKeys(notifiedAlertKeysRef.current)
+  }, [])
 
   // CronJob health results cache — fetched async, read synchronously by evaluator
   const cronJobResultsRef = useRef<Record<string, GPUHealthCheckResult[]>>({})
@@ -435,9 +451,10 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
 
   // Fetch CronJob results for all clusters periodically
   useEffect(() => {
+    let unmounted = false
     const fetchCronJobResults = async () => {
       const token = localStorage.getItem(STORAGE_KEY_AUTH_TOKEN)
-      if (!token) return
+      if (!token || unmounted) return
       const currentClusters = clustersRef.current
       if (!currentClusters.length) return
 
@@ -452,8 +469,6 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
               { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) }
             )
             if (resp.ok) {
-              // Use .catch() on .json() to prevent Firefox from firing unhandledrejection
-              // before the outer try/catch processes the rejection (microtask timing issue).
               const data = await resp.json().catch(() => null)
               if (data?.results && data.results.length > 0) {
                 results[cluster.name] = data.results
@@ -465,14 +480,13 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
         })
       )
 
-      cronJobResultsRef.current = results
+      if (!unmounted) cronJobResultsRef.current = results
     }
 
-    // Initial fetch after short delay
     const timer = setTimeout(fetchCronJobResults, INITIAL_FETCH_DELAY_MS)
-    // Refresh every 60 seconds
     const interval = setInterval(fetchCronJobResults, POLL_INTERVAL_SLOW_MS)
     return () => {
+      unmounted = true
       clearTimeout(timer)
       clearInterval(interval)
     }
@@ -480,14 +494,14 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
 
   // Fetch nightly E2E run data periodically (public endpoint, no auth needed)
   useEffect(() => {
+    let unmounted = false
     const fetchNightlyE2E = async () => {
+      if (unmounted) return
       try {
         const API_BASE = import.meta.env.VITE_API_BASE_URL || ''
         const resp = await fetch(`${API_BASE}/api/public/nightly-e2e/runs`, {
           signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
-        if (resp.ok) {
-          // Use .catch() on .json() to prevent Firefox from firing unhandledrejection
-          // before the outer try/catch processes the rejection (microtask timing issue).
+        if (resp.ok && !unmounted) {
           const data = await resp.json().catch(() => null)
           if (Array.isArray(data)) {
             nightlyE2ERef.current = data
@@ -501,6 +515,7 @@ export function AlertsProvider({ children }: { children: ReactNode }) {
     const timer = setTimeout(fetchNightlyE2E, SECONDARY_FETCH_DELAY_MS)
     const interval = setInterval(fetchNightlyE2E, NIGHTLY_E2E_POLL_INTERVAL_MS)
     return () => {
+      unmounted = true
       clearTimeout(timer)
       clearInterval(interval)
     }
@@ -1249,7 +1264,7 @@ Please provide:
             rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) &&
             (!notifiedAlertKeysRef.current.has(notifKey) || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS)
           ) {
-            notifiedAlertKeysRef.current.set(notifKey, Date.now())
+            setNotifiedKey(notifKey, Date.now())
             const firstNode = failedNodes[0]
             sendNotificationWithDeepLink(
               `GPU Health Alert: ${cluster.name}`,
@@ -1305,7 +1320,7 @@ Please provide:
             rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) &&
             (!notifiedAlertKeysRef.current.has(notifKey) || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS)
           ) {
-            notifiedAlertKeysRef.current.set(notifKey, Date.now())
+            setNotifiedKey(notifKey, Date.now())
             sendNotificationWithDeepLink(
               `Disk Pressure: ${cluster.name}`,
               diskPressureIssue,
@@ -1394,7 +1409,7 @@ Please provide:
           rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) &&
           (!notifiedAlertKeysRef.current.has(notifKey) || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS)
         ) {
-          notifiedAlertKeysRef.current.set(notifKey, Date.now())
+          setNotifiedKey(notifKey, Date.now())
           sendNotificationWithDeepLink(
             `DNS Failure: ${cluster}`,
             `${pods.length} CoreDNS pod(s) unhealthy — ${issues || 'check pod status'}`,
@@ -1446,7 +1461,7 @@ Please provide:
           if (
             rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) && shouldNotify
           ) {
-            notifiedAlertKeysRef.current.set(notifKey, Date.now())
+            setNotifiedKey(notifKey, Date.now())
             sendNotificationWithDeepLink(
               `Certificate Error: ${cluster.name}`,
               cluster.errorMessage || 'TLS certificate validation failed',
@@ -1456,7 +1471,7 @@ Please provide:
         } else {
           // Auto-resolve if cert error clears — also clear dedup so next failure re-notifies
           const notifKey = alertDedupKey(rule.id, rule.condition.type, cluster.name)
-          notifiedAlertKeysRef.current.delete(notifKey)
+          deleteNotifiedKey(notifKey)
           queueAutoResolve(rule.id, cluster.name)
         }
       }
@@ -1499,7 +1514,7 @@ Please provide:
           if (
             rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) && shouldNotify
           ) {
-            notifiedAlertKeysRef.current.set(notifKey, Date.now())
+            setNotifiedKey(notifKey, Date.now())
             sendNotificationWithDeepLink(
               `Cluster Unreachable: ${cluster.name}`,
               `${errorLabel}${cluster.lastSeen ? ` — last seen ${cluster.lastSeen}` : ''}`,
@@ -1509,7 +1524,7 @@ Please provide:
         } else if (cluster.reachable !== false) {
           // Auto-resolve when cluster becomes reachable — clear dedup so next failure re-notifies
           const notifKey = alertDedupKey(rule.id, rule.condition.type, cluster.name)
-          notifiedAlertKeysRef.current.delete(notifKey)
+          deleteNotifiedKey(notifKey)
           queueAutoResolve(rule.id, cluster.name)
         }
       }
@@ -1567,7 +1582,7 @@ Please provide:
             rule.channels?.some(ch => ch.type === 'browser' && ch.enabled) &&
             (!notifiedAlertKeysRef.current.has(notifKey) || (Date.now() - (notifiedAlertKeysRef.current.get(notifKey) ?? 0)) > NOTIFICATION_COOLDOWN_MS)
           ) {
-            notifiedAlertKeysRef.current.set(notifKey, Date.now())
+            setNotifiedKey(notifKey, Date.now())
             sendNotificationWithDeepLink(
               `Nightly E2E Failed: ${guide.acronym} (${guide.platform})`,
               `Run #${run.runNumber} failed — ${guide.guide}`,

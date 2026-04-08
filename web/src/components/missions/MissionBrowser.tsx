@@ -11,6 +11,7 @@ import {
   Loader2, ExternalLink, RefreshCw } from 'lucide-react'
 import { cn } from '../../lib/cn'
 import { api } from '../../lib/api'
+import { isDemoMode } from '../../lib/demoMode'
 import { useAuth } from '../../lib/auth'
 import { FETCH_EXTERNAL_TIMEOUT_MS } from '../../lib/constants/network'
 import { matchMissionsToCluster } from '../../lib/missions/matcher'
@@ -373,7 +374,14 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
   // Select a card mission — fetch full content on demand
   // ============================================================================
 
+  // Track the latest selection to prevent stale async responses from overwriting
+  const latestSelectionRef = useRef<string>('')
+
   const selectCardMission = async (mission: MissionExport) => {
+    // Use title + type as unique key (MissionExport has no id field)
+    const selectionKey = `${mission.title}::${mission.type}`
+    latestSelectionRef.current = selectionKey
+
     // Show index metadata immediately for instant feedback
     setSelectedMission(mission)
     setIsMissionLoading(true)
@@ -384,14 +392,19 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
     // Fetch full file content (steps, uninstall, upgrade, troubleshooting)
     try {
       const { mission: fullMission, raw } = await fetchMissionContent(mission)
-      // Only update if this mission is still selected (user might have navigated away)
-      setSelectedMission((current) => current?.title === mission.title ? fullMission : current)
-      setRawContent((current) => current === JSON.stringify(mission, null, 2) ? raw : current)
+      // Only update if this is still the latest selection (prevents race condition)
+      if (latestSelectionRef.current === selectionKey) {
+        setSelectedMission(fullMission)
+        setRawContent(raw)
+      }
     } catch {
-      // Keep the index metadata so basic info is still visible, but surface the error
-      setMissionContentError('Failed to load full mission content. Steps may be incomplete.')
+      if (latestSelectionRef.current === selectionKey) {
+        setMissionContentError('Failed to load full mission content. Steps may be incomplete.')
+      }
     } finally {
-      setIsMissionLoading(false)
+      if (latestSelectionRef.current === selectionKey) {
+        setIsMissionLoading(false)
+      }
     }
   }
 
@@ -691,9 +704,20 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
             )
           )
         } else if (node.source === 'github') {
+          // In demo mode, api.get() throws BackendUnavailableError — use static demo data
+          if (isDemoMode() && node.id === 'kubara') {
+            setDirectoryEntries([
+              { name: 'prometheus-stack', path: 'helm/prometheus-stack', type: 'directory' },
+              { name: 'cert-manager', path: 'helm/cert-manager', type: 'directory' },
+              { name: 'falco-runtime-security', path: 'helm/falco-runtime-security', type: 'directory' },
+              { name: 'kyverno-policies', path: 'helm/kyverno-policies', type: 'directory' },
+              { name: 'argocd-gitops', path: 'helm/argocd-gitops', type: 'directory' },
+              { name: 'istio-service-mesh', path: 'helm/istio-service-mesh', type: 'directory' },
+              { name: 'velero-backups', path: 'helm/velero-backups', type: 'directory' },
+              { name: 'external-secrets', path: 'helm/external-secrets', type: 'directory' },
+            ])
+          } else {
           // Fetch repo contents via GitHub Contents API proxy
-          // If repoOwner/repoName are set (external sources like Kubara), use them
-          // Otherwise node.path is "owner/repo" or "owner/repo/subpath"
           const owner = node.repoOwner || node.path.split('/')[0]
           const repo = node.repoName || node.path.split('/')[1]
           const subPath = node.repoOwner ? node.path : node.path.split('/').slice(2).join('/')
@@ -709,6 +733,7 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
               type: e.type === 'dir' ? 'directory' as const : 'file' as const,
               size: e.size }))
           setDirectoryEntries(entries)
+          }
         } else {
           setDirectoryEntries([])
         }
@@ -1171,7 +1196,7 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
 
       {/* Filter bar — constrained height on mobile with scroll */}
       {showFilters && (
-        <div className="px-4 py-2.5 bg-card border-b border-border space-y-2 max-h-[40vh] md:max-h-none overflow-y-auto">
+        <div className="px-4 py-2.5 bg-card border-b border-border space-y-2 max-h-[40vh] md:max-h-[50vh] overflow-y-auto">
           {/* Row 1: Clear all + Match % + Source + Category */}
           <div className="flex items-center gap-3 flex-wrap">
             {activeFilterCount > 0 && (
@@ -1905,7 +1930,7 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
             {/* ============================================================ */}
             {/* FIXES TAB */}
             {/* ============================================================ */}
-            {!selectedMission && !unstructuredContent && filteredEntries.length === 0 && activeTab === 'fixes' && (
+            {!selectedMission && !unstructuredContent && activeTab === 'fixes' && (
               <div className="space-y-4">
                 {/* Fixer filters */}
                 <div className="flex flex-wrap items-center gap-2">

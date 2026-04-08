@@ -207,9 +207,7 @@ export const CARD_ICONS: Record<string, { icon: ComponentType<{ className?: stri
   kube_snake: { icon: Gamepad2, color: 'text-green-400' },
   kube_galaga: { icon: Rocket, color: 'text-blue-400' },
   kube_doom: { icon: Gamepad2, color: 'text-red-400' },
-  kube_craft: { icon: Puzzle, color: 'text-brown-400' },
   kube_chess: { icon: Crown, color: 'text-yellow-400' },
-  kube_craft_3d: { icon: Puzzle, color: 'text-green-400' },
 
   // Kagenti (kagenti-operator) cards
   kagenti_status: { icon: Activity, color: 'text-purple-400' },
@@ -235,6 +233,7 @@ export const CARD_ICONS: Record<string, { icon: ComponentType<{ className?: stri
   kubeflex_status: { icon: Layers, color: 'text-purple-400' },
   k3s_status: { icon: Box, color: 'text-green-400' },
   kubevirt_status: { icon: Monitor, color: 'text-orange-400' },
+  vcluster_status: { icon: Layers, color: 'text-purple-400' },
   multi_tenancy_overview: { icon: Shield, color: 'text-cyan-400' },
   tenant_isolation_setup: { icon: Settings, color: 'text-yellow-400' },
   tenant_topology: { icon: GitBranch, color: 'text-emerald-400' },

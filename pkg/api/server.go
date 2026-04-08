@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
@@ -145,6 +146,7 @@ type Server struct {
 	loadingSrv          *http.Server // temporary loading screen server
 	shuttingDown        int32        // atomic flag: 1 during graceful shutdown
 	gpuUtilWorker       *GPUUtilizationWorker
+	done                chan struct{} // closed on Shutdown to stop background goroutines
 }
 
 // NewServer creates a new API server. It starts a temporary loading page
@@ -221,10 +223,10 @@ func NewServer(cfg Config) (*Server, error) {
 	// Initialize Kubernetes multi-cluster client
 	k8sClient, err := k8s.NewMultiClusterClient(cfg.Kubeconfig)
 	if err != nil {
-		slog.Info("No kubeconfig found — connect clusters via Settings or place a kubeconfig at ~/.kube/config")
+		slog.Warn("Kubernetes client initialization failed — connect clusters via Settings or place a kubeconfig at ~/.kube/config", "error", err)
 	} else {
 		if err := k8sClient.LoadConfig(); err != nil {
-			slog.Info("No kubeconfig found — connect clusters via Settings or place a kubeconfig at ~/.kube/config")
+			slog.Warn("Failed to load kubeconfig — connect clusters via Settings or place a kubeconfig at ~/.kube/config", "error", err)
 		} else {
 			slog.Info("Kubernetes client initialized successfully")
 			// Warmup: probe all clusters to populate health cache before serving.
@@ -238,8 +240,7 @@ func NewServer(cfg Config) (*Server, error) {
 				slog.Info("Broadcasted kubeconfig change to all clients")
 			})
 			if err := k8sClient.StartWatching(); err != nil {
-				// Watcher fails when kubeconfig doesn't exist — already logged above
-				_ = err
+				slog.Warn("Kubeconfig file watcher failed to start", "error", err)
 			}
 		}
 	}
@@ -298,6 +299,7 @@ func NewServer(cfg Config) (*Server, error) {
 		notificationService: notificationService,
 		persistenceStore:    persistenceStore,
 		loadingSrv:          loadingSrv,
+		done:                make(chan struct{}),
 	}
 
 	server.setupMiddleware()
@@ -434,8 +436,30 @@ func (s *Server) setupRoutes() {
 			return c.JSON(fiber.Map{"status": "shutting_down", "version": Version})
 		}
 		inCluster := s.k8sClient != nil && s.k8sClient.IsInCluster()
+
+		// Determine cluster reachability status. If we have a k8s client,
+		// check cached health data — if no clusters are reachable, report
+		// "degraded" instead of "ok" so monitoring can detect the problem.
+		healthStatus := "ok"
+		if s.k8sClient != nil {
+			cachedHealth := s.k8sClient.GetCachedHealth()
+			if len(cachedHealth) > 0 {
+				anyReachable := false
+				for _, h := range cachedHealth {
+					if h != nil && h.Reachable {
+						anyReachable = true
+						break
+					}
+				}
+				if !anyReachable {
+					healthStatus = "degraded"
+				}
+			}
+			// If no cached health data yet, keep "ok" — health poller hasn't run yet
+		}
+
 		resp := fiber.Map{
-			"status":           "ok",
+			"status":           healthStatus,
 			"version":          Version,
 			"oauth_configured": s.config.GitHubClientID != "",
 			"in_cluster":       inCluster,
@@ -480,14 +504,29 @@ func (s *Server) setupRoutes() {
 		return c.JSON(resp)
 	})
 
-	// Version endpoint — lightweight, returns only build metadata
+	// Version endpoint — lightweight, returns only build metadata.
+	// In dev mode (go run), VCS info from debug.ReadBuildInfo() may be empty,
+	// so we fall back to git commands for commit and time.
 	s.app.Get("/api/version", func(c *fiber.Ctx) error {
+		gitCommit := buildInfo.VCSRevision
+		gitTime := buildInfo.VCSTime
+		gitDirty := buildInfo.VCSModified == "true"
+
+		// Fallback: if VCS revision is empty (e.g. go run without VCS info),
+		// try to read from git directly
+		if gitCommit == "" {
+			gitCommit = gitFallbackRevision()
+		}
+		if gitTime == "" {
+			gitTime = gitFallbackTime()
+		}
+
 		return c.JSON(fiber.Map{
 			"version":    Version,
 			"go_version": buildInfo.GoVersion,
-			"git_commit": buildInfo.VCSRevision,
-			"git_time":   buildInfo.VCSTime,
-			"git_dirty":  buildInfo.VCSModified == "true",
+			"git_commit": gitCommit,
+			"git_time":   gitTime,
+			"git_dirty":  gitDirty,
 		})
 	})
 
@@ -590,6 +629,9 @@ func (s *Server) setupRoutes() {
 	// YouTube playlist (public — proxies to YouTube RSS feed, cached 1h)
 	s.app.Get("/api/youtube/playlist", handlers.YouTubePlaylistHandler)
 	s.app.Get("/api/youtube/thumbnail/:id", handlers.YouTubeThumbnailProxy)
+
+	// Medium blog (public — proxies to Medium RSS feed, cached 1h)
+	s.app.Get("/api/medium/blog", handlers.MediumBlogHandler)
 
 	// Mission knowledge base browse/file (public — proxies to public GitHub repo)
 	missions := handlers.NewMissionsHandler()
@@ -715,6 +757,15 @@ func (s *Server) setupRoutes() {
 
 	// Mission knowledge base routes (validate, share — protected)
 	missions.RegisterRoutes(api.Group("/missions"))
+
+	// Orbit (recurring maintenance) routes — protected
+	orbitDataDir := filepath.Dir(s.config.DatabasePath)
+	if orbitDataDir == "" || orbitDataDir == "." {
+		orbitDataDir = "./data"
+	}
+	orbit := handlers.NewOrbitHandler(orbitDataDir)
+	orbit.RegisterRoutes(api.Group("/orbit"))
+	orbit.StartScheduler(s.done)
 
 	// MCP routes (cluster operations via kubestellar tools and direct k8s)
 	// SECURITY: All MCP routes require authentication in both dev and production modes
@@ -1184,6 +1235,9 @@ func waitForPortRelease(port int, timeout time.Duration) error {
 func (s *Server) Shutdown() error {
 	atomic.StoreInt32(&s.shuttingDown, 1)
 
+	// Signal background goroutines (orbit scheduler, etc.) to stop.
+	close(s.done)
+
 	// If Shutdown is called before Start, the temporary loading server
 	// is still running and holding the port. Shut it down first.
 	if s.loadingSrv != nil {
@@ -1229,7 +1283,11 @@ func customErrorHandler(c *fiber.Ctx, err error) error {
 func LoadConfigFromEnv() Config {
 	port := 8080
 	if p := os.Getenv("PORT"); p != "" {
-		fmt.Sscanf(p, "%d", &port)
+		if v, err := strconv.Atoi(p); err != nil {
+			slog.Warn("[Server] invalid PORT, using default", "value", p, "default", port, "error", err)
+		} else {
+			port = v
+		}
 	}
 
 	var backendPort int
@@ -1356,6 +1414,27 @@ func generateDevSecret() string {
 		return fmt.Sprintf("dev-fallback-%d", b)
 	}
 	return hex.EncodeToString(b)
+}
+
+// gitFallbackRevision returns the current git HEAD SHA by shelling out to git.
+// Used as a fallback when debug.ReadBuildInfo() doesn't include VCS metadata
+// (e.g. when running with `go run` outside a module-aware build).
+func gitFallbackRevision() string {
+	out, err := exec.Command("git", "rev-parse", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// gitFallbackTime returns the commit time of HEAD by shelling out to git.
+// Used as a fallback when debug.ReadBuildInfo() doesn't include VCS metadata.
+func gitFallbackTime() string {
+	out, err := exec.Command("git", "log", "-1", "--format=%cI").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // detectInstallMethod returns how the console was installed: dev, binary, or helm.

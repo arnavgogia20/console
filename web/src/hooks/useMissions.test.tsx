@@ -804,11 +804,11 @@ describe('demo mode', () => {
     expect(MockWebSocket.lastInstance).toBeNull()
   })
 
-  it('returns empty missions initially when localStorage has no data', () => {
+  it('returns pre-populated demo missions when localStorage has no data', () => {
     vi.mocked(getDemoMode).mockReturnValue(true)
     const { result } = renderHook(() => useMissions(), { wrapper })
-    // No missions are in localStorage — provider starts with []
-    expect(result.current.missions).toHaveLength(0)
+    // Demo mode seeds with pre-populated missions so the feature is visible
+    expect(result.current.missions.length).toBeGreaterThan(0)
   })
 
   it('startMission in demo mode transitions mission to failed (no agent)', async () => {
@@ -2353,6 +2353,44 @@ describe('mission timeout interval', () => {
       expect(mission?.status).toBe('failed')
       expect(mission?.messages.some(m => m.content.includes('Agent Not Responding'))).toBe(true)
       expect(emitMissionError).toHaveBeenCalledWith('troubleshoot', 'mission_inactivity')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('progress events reset inactivity timer so long-running tools do not timeout', async () => {
+    vi.useFakeTimers()
+    try {
+      const { result } = renderHook(() => useMissions(), { wrapper })
+      const { missionId, requestId } = await startMissionWithConnection(result)
+
+      // Send a stream chunk to start tracking inactivity
+      act(() => {
+        MockWebSocket.lastInstance?.simulateMessage({
+          id: requestId,
+          type: 'stream',
+          payload: { content: 'Installing Drasi...', done: false },
+        })
+      })
+
+      // Advance 60s — within 90s window, still alive
+      act(() => { vi.advanceTimersByTime(60_000) })
+
+      // Send a progress event (heartbeat from tool execution)
+      act(() => {
+        MockWebSocket.lastInstance?.simulateMessage({
+          id: requestId,
+          type: 'progress',
+          payload: { step: 'Still working...' },
+        })
+      })
+
+      // Advance another 60s — 120s total, but only 60s since last progress event
+      act(() => { vi.advanceTimersByTime(60_000) })
+
+      // Mission should still be running (progress reset the timer)
+      const mission = result.current.missions.find(m => m.id === missionId)
+      expect(mission?.status).toBe('running')
     } finally {
       vi.useRealTimers()
     }

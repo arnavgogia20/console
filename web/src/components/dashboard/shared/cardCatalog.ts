@@ -288,7 +288,6 @@ export const CARD_CATALOG = {
     { type: 'kube_pong', title: 'Kube Pong', description: 'Classic Pong game - play against AI with adjustable difficulty', visualization: 'status' },
     { type: 'kube_snake', title: 'Kube Snake', description: 'Classic Snake game - grow by collecting dots without hitting walls', visualization: 'status' },
     { type: 'kube_galaga', title: 'Kube Galaga', description: 'Space shooter with enemy waves and power-ups', visualization: 'status' },
-    { type: 'kube_craft', title: 'KubeCraft 2D', description: '2D Minecraft-style block builder with terrain generation', visualization: 'status' },
     { type: 'kube_bert', title: 'Kube Bert', description: 'Q*bert-style pyramid hopper — change every tile while dodging enemies', visualization: 'status' },
     { type: 'missile_command', title: 'Missile Command', description: 'Defend your Kubernetes clusters from incoming missiles', visualization: 'status' },
     { type: 'kube_doom', title: 'Kube Doom', description: 'Raycasting FPS - eliminate rogue CrashPods, OOMKillers, and ZombieDeploys', visualization: 'status' },
@@ -314,7 +313,7 @@ export const CARD_CATALOG = {
     { type: 'ovn_status', title: 'OVN-Kubernetes', description: 'OVN network and UDN status', visualization: 'status' },
     { type: 'kubeflex_status', title: 'KubeFlex', description: 'Control plane management', visualization: 'status' },
     { type: 'k3s_status', title: 'K3s', description: 'Lightweight Kubernetes clusters', visualization: 'status' },
-    { type: 'kubevirt_status', title: 'KubeVirt', description: 'Virtual machine management', visualization: 'status' },
+    { type: 'kubevirt_status', title: 'KubeVirt Status', description: 'VM status across clusters with per-cluster breakdown, CPU/memory, and health', visualization: 'status' },
   ],
   'Orchestration': [
     { type: 'keda_status', title: 'KEDA', description: 'KEDA autoscaler status, scaled object metrics, and trigger queue depths', visualization: 'status' },

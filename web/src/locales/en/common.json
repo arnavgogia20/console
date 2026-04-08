@@ -447,7 +447,19 @@
       "vclusterCreateNew": "Create Virtual Cluster",
       "vclusterDefaultNamespace": "vcluster",
       "vclusterDeleteConfirm": "Delete virtual cluster \"{{name}}\" in namespace \"{{namespace}}\"? This cannot be undone.",
-      "selectHostCluster": "Select a host cluster..."
+      "selectHostCluster": "Select a host cluster...",
+      "kubevirtSection": "KubeVirt",
+      "kubevirtDesc": "Run virtual machines on Kubernetes clusters",
+      "kubevirtInstalled": "KubeVirt installed",
+      "kubevirtNotInstalled": "Not installed",
+      "kubevirtInstallOnCluster": "Install with AI Agent",
+      "kubevirtNoClusters": "No connected clusters. Connect a cluster to check for KubeVirt.",
+      "kubevirtDetectedCount": "KubeVirt detected on {{count}} cluster(s)",
+      "kubevirtDetectedCount_one": "KubeVirt detected on {{count}} cluster",
+      "kubevirtDetectedCount_other": "KubeVirt detected on {{count}} clusters",
+      "kubevirtNotDetected": "KubeVirt Not Detected",
+      "kubevirtInstallHint": "KubeVirt lets you run virtual machines alongside containers on your Kubernetes clusters. Use the guided mission to install it.",
+      "kubevirtOpenMission": "Open Install KubeVirt Mission"
     },
     "backup": {
       "title": "Backup & Sync",
@@ -603,7 +615,14 @@
       "prereqGitCleanOk": "Clean",
       "prereqGitCleanFail": "Uncommitted changes",
       "allPrereqsMet": "All prerequisites met — update notifications active",
-      "prereqsMissing": "{{count}} prerequisite(s) not met — some features unavailable"
+      "prereqsMissing": "{{count}} prerequisite(s) not met — some features unavailable",
+      "scopeInfoToggle": "What do these settings control?",
+      "scopeSystemTitle": "System Updates",
+      "scopeSystemDesc": "Updates the entire console application to a new version. Controlled by the Update Channel and Auto-Update settings on this page.",
+      "scopeReloadTitle": "Auto-Reload",
+      "scopeReloadDesc": "When a new build is deployed, your browser automatically detects the change and prompts you to reload. This happens independently of System Updates.",
+      "scopeCardDataTitle": "Card Data",
+      "scopeCardDataDesc": "Individual dashboard cards refresh their data on their own schedules. Card refreshes are not controlled by System Updates."
     },
     "theme": {
       "title": "Appearance",
@@ -965,12 +984,12 @@
       "chooseCardType": "Choose Card Type",
       "describeWhatYouNeed": "Describe What You Need",
       "searchCards": "Search cards...",
-      "aiPoweredCreation": "AI-Powered Card Creation",
-      "aiCreationDescription": "Describe what you want to see and we'll create the perfect card for you.",
+      "smartSuggestions": "Smart Suggestions",
+      "smartSuggestionsDescription": "Describe what you want to see and we'll suggest the best card for you.",
       "whatToTrack": "What do you want to track or monitor?",
       "aiPlaceholder": "e.g., 'Show me pods that have restarted more than 5 times in the last hour'",
-      "generating": "Generating...",
-      "generateCard": "Generate Card",
+      "generating": "Matching...",
+      "generateCard": "Find Card",
       "suggestedCard": "Suggested Card",
       "titleLabel": "Title:",
       "typeLabel": "Type:",
@@ -1688,6 +1707,66 @@
     "upvote": "Upvote",
     "upvoted": "Upvoted"
   },
+  "nps": {
+    "title": "How's your experience with KubeStellar Console?",
+    "notGreat": "Not great",
+    "meh": "Meh",
+    "good": "Good",
+    "loveIt": "Love it!",
+    "feedbackNegative": "What could we improve?",
+    "feedbackNeutral": "What would make it even better?",
+    "feedbackPositive": "What do you love most?",
+    "feedbackPlaceholder": "Your feedback (optional)",
+    "submit": "Submit",
+    "dismiss": "Not now",
+    "thankYou": "Thank you for your feedback!",
+    "thankYouDetail": "Your input helps us improve KubeStellar Console."
+  },
+  "orbit": {
+    "title": "Orbital Maintenance",
+    "keepInOrbit": "Keep it in orbit",
+    "keepInOrbitDescription": "Set up recurring maintenance to keep your deployment healthy.",
+    "setupOrbit": "Set Up Orbit",
+    "skip": "Skip",
+    "healthCheck": "Health Check",
+    "healthCheckDescription": "Verify pod readiness, service endpoints, and resource availability.",
+    "certRotation": "Certificate Rotation",
+    "certRotationDescription": "Check TLS certificate expiry dates and flag certificates expiring soon.",
+    "versionDrift": "Version Drift",
+    "versionDriftDescription": "Compare installed versions against latest available releases.",
+    "resourceQuota": "Resource Quota",
+    "resourceQuotaDescription": "Monitor namespace quotas and alert when usage approaches limits.",
+    "backupVerification": "Backup Verification",
+    "backupVerificationDescription": "Verify that backup jobs completed successfully.",
+    "cadenceDaily": "Daily",
+    "cadenceWeekly": "Weekly",
+    "cadenceMonthly": "Monthly",
+    "dueIn": "Due in {{time}}",
+    "overdue": "Overdue by {{time}}",
+    "lastRun": "Last run {{time}} ago",
+    "neverRun": "Never run",
+    "runNow": "Run Now",
+    "changeCadence": "Change Cadence",
+    "groundControl": "Ground Control",
+    "groundControlDescription": "Auto-generate a monitoring dashboard for your deployment.",
+    "autoRunDescription": "Run maintenance automatically when due.",
+    "createDashboard": "Create Dashboard",
+    "viewDashboard": "View Dashboard",
+    "cardRequest": "No monitoring card for {{project}} yet",
+    "cardRequestAction": "Request Card",
+    "reminderTitle": "Orbital maintenance due",
+    "reminderDismiss": "Dismiss",
+    "standaloneTitle": "New Orbit Mission",
+    "standaloneSelectType": "Select orbit type",
+    "standaloneCadence": "Cadence",
+    "standaloneTargetClusters": "Target clusters",
+    "standaloneClustersLoading": "Loading clusters...",
+    "standaloneNoClusters": "No clusters available",
+    "standaloneSelectAll": "Select all",
+    "standaloneDeselectAll": "Deselect all",
+    "standaloneCreate": "Create Orbit",
+    "addOrbit": "Add Orbit"
+  },
   "update": {
     "available": "Update Available",
     "availableTag": "Update available: {{tag}}"
@@ -2003,7 +2082,29 @@
       "gitopsBestPractices": "GitOps Best Practices",
       "defaultDeploymentName": "<deployment-name>",
       "syncSuccessMessage": "Sync triggered for application \"{{appName}}\" in namespace \"{{namespace}}\". Argo CD will reconcile the desired state from Git.",
-      "syncFailedMessage": "Failed to trigger sync: {{error}}"
+      "syncFailedMessage": "Failed to trigger sync: {{error}}",
+      "noResourcesFound": "No resources found",
+      "noSyncHistory": "No sync history available",
+      "noManifest": "No manifest available",
+      "clickAnalyze": "Click \"Analyze Application\" to get AI-powered GitOps analysis",
+      "analyzeHint": "AI will analyze sync status, health, and suggest improvements"
+    },
+    "crd": {
+      "noVersionInfo": "No version information available",
+      "noInstancesFound": "No instances found",
+      "schemaNotAvailable": "Schema not available",
+      "clickAnalyze": "Click \"Analyze CRD\" to get AI-powered analysis",
+      "analyzeHint": "AI will analyze the CRD and suggest improvements"
+    },
+    "compliance": {
+      "allStatuses": "All Statuses",
+      "allSeverities": "All Severities",
+      "allClusters": "All Clusters",
+      "allProfiles": "All Profiles",
+      "critical": "Critical",
+      "high": "High",
+      "medium": "Medium",
+      "low": "Low"
     },
     "kustomization": {
       "noResources": "No resources found",
@@ -3086,7 +3187,8 @@
   "clusters": {
     "groups": {
       "deleteTitle": "Delete Cluster Group",
-      "deleteMessage": "Are you sure you want to delete this cluster group? This action cannot be undone."
+      "deleteMessage": "Are you sure you want to delete this cluster group? This action cannot be undone.",
+      "title": "Cluster Groups ({{count}})"
     }
   },
   "discardUnsavedChanges": "Discard unsaved changes?",
@@ -3173,7 +3275,9 @@
         "videoTutorials": "Video Tutorials",
         "comingSoon": "Coming soon",
         "subscribeToPlaylist": "Subscribe to playlist",
-        "resources": "Resources"
+        "resources": "Resources",
+        "latestBlogPosts": "Latest Blog Posts",
+        "viewAll": "View all"
       }
     },
     "missionSidebar": {
@@ -3213,6 +3317,20 @@
       "issues": "Issues",
       "troubleshoot": "Troubleshoot",
       "replicasReady": "{{readyReplicas}}/{{replicas}} ready"
+    }
+  },
+  "missions": {
+    "detail": {
+      "tabs": {
+        "install": "Install",
+        "installEmpty": "No install steps available.",
+        "uninstall": "Uninstall",
+        "uninstallEmpty": "Uninstall steps not yet available for this mission.",
+        "upgrade": "Update / Upgrade",
+        "upgradeEmpty": "Upgrade steps not yet available for this mission.",
+        "troubleshooting": "Troubleshooting",
+        "troubleshootingEmpty": "Troubleshooting steps not yet available for this mission."
+      }
     }
   }
 }

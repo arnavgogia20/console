@@ -5,8 +5,9 @@
 import { useState } from 'react'
 import {
   Telescope, Compass, Map, Rocket, Shield, Star, Crown, Sparkles,
-  Coins, ChevronDown, ChevronUp, Linkedin,
+  Coins, ChevronDown, ChevronUp,
 } from 'lucide-react'
+import { Linkedin } from '@/lib/icons'
 import { useRewards } from '../../hooks/useRewards'
 import { getContributorLevel, CONTRIBUTOR_LEVELS } from '../../types/rewards'
 import { emitLinkedInShare } from '../../lib/analytics'
@@ -97,6 +98,7 @@ export function ContributorBanner() {
                   current.color === 'purple' ? 'bg-purple-400' :
                   current.color === 'yellow' ? 'bg-yellow-400' :
                   current.color === 'orange' ? 'bg-orange-400' :
+                  current.color === 'red' ? 'bg-red-400' :
                   'bg-yellow-400'
                 }`}
                 style={{ width: `${progress}%` }}

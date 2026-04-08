@@ -121,6 +121,11 @@ func (s *Server) handleKagentiAgents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.validateToken(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	if s.k8sClient == nil {
 		json.NewEncoder(w).Encode(map[string]any{"agents": []any{}})
 		return
@@ -198,6 +203,11 @@ func (s *Server) handleKagentiBuilds(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.validateToken(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	if s.k8sClient == nil {
 		json.NewEncoder(w).Encode(map[string]any{"builds": []any{}})
 		return
@@ -270,6 +280,11 @@ func (s *Server) handleKagentiCards(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.validateToken(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	if s.k8sClient == nil {
 		json.NewEncoder(w).Encode(map[string]any{"cards": []any{}})
 		return
@@ -317,7 +332,13 @@ func (s *Server) handleKagentiCards(w http.ResponseWriter, r *http.Request) {
 			c.Skills = nestedStringSlice(specMap, "skills")
 			c.Capabilities = nestedStringSlice(specMap, "capabilities")
 			c.SyncPeriod = nestedString(specMap, "syncPeriod")
-			c.IdentityBinding = nestedString(specMap, "identityBinding", "spiffeId")
+			// identityBinding is a top-level spec field (e.g. "strict", "permissive", "none"),
+			// not nested under spiffeId. Fall back to "none" when the field is absent
+			// so the frontend doesn't classify empty strings as SPIFFE-bound.
+			c.IdentityBinding = nestedString(specMap, "identityBinding")
+			if c.IdentityBinding == "" {
+				c.IdentityBinding = "none"
+			}
 		}
 		cards = append(cards, c)
 	}
@@ -331,6 +352,11 @@ func (s *Server) handleKagentiTools(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if !s.validateToken(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -395,6 +421,11 @@ func (s *Server) handleKagentiSummary(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if !s.validateToken(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 

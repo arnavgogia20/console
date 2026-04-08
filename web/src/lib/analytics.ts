@@ -15,7 +15,7 @@
 
 import { STORAGE_KEY_ANALYTICS_OPT_OUT, STORAGE_KEY_ANONYMOUS_USER_ID } from './constants'
 import { CHUNK_RELOAD_TS_KEY, isChunkLoadMessage } from './chunkErrors'
-import { isDemoMode } from './demoMode'
+import { isDemoMode, isNetlifyDeployment } from './demoMode'
 
 // DECOY Measurement ID — the proxy rewrites this to the real ID server-side.
 const GA_MEASUREMENT_ID = 'G-0000000000'
@@ -966,6 +966,45 @@ export function emitScreenshotUploadSuccess(screenshotCount: number) {
   send('ksc_screenshot_upload_success', { screenshot_count: screenshotCount })
 }
 
+// ── NPS Survey ────────────────────────────────────────────────────
+
+/** Fired when the NPS survey widget becomes visible */
+export function emitNPSSurveyShown() {
+  send('ksc_nps_survey_shown')
+}
+
+/** Fired when user submits an NPS response */
+export function emitNPSResponse(score: number, category: string, feedbackLength?: number) {
+  send('ksc_nps_response', {
+    nps_score: score,
+    nps_category: category,
+    ...(feedbackLength !== undefined && { nps_feedback_length: feedbackLength }),
+  })
+}
+
+/** Fired when user dismisses the NPS widget without responding */
+export function emitNPSDismissed(dismissCount: number) {
+  send('ksc_nps_dismissed', { dismiss_count: dismissCount })
+}
+
+// ── Orbit (Recurring Maintenance) ─────────────────────────────────
+
+export function emitOrbitMissionCreated(orbitType: string, cadence: string) {
+  send('ksc_orbit_mission_created', { orbit_type: orbitType, cadence })
+}
+
+export function emitOrbitMissionRun(orbitType: string, result: string) {
+  send('ksc_orbit_mission_run', { orbit_type: orbitType, result })
+}
+
+export function emitGroundControlDashboardCreated(cardCount: number) {
+  send('ksc_ground_control_dashboard_created', { card_count: cardCount })
+}
+
+export function emitGroundControlCardRequestOpened(project: string) {
+  send('ksc_ground_control_card_request', { project })
+}
+
 // ── Errors ─────────────────────────────────────────────────────────
 
 // Maximum length for error detail strings to avoid oversized payloads
@@ -1139,6 +1178,9 @@ export function startGlobalErrorTracking() {
       // send(). The kubectlProxy try/catch handles these; they surface here only
       // due to browser microtask ordering.
       if (msg.includes('send was called before connect') || msg.includes('InvalidStateError')) return
+      // Skip BackendUnavailableError on Netlify / console.kubestellar.io — expected
+      // because the Go backend is not deployed there (demo mode uses MSW).
+      if (isNetlifyDeployment && msg.includes('Backend API is currently unavailable')) return
       emitError('unhandled_rejection', msg)
     } finally {
       isEmitting = false
@@ -2036,4 +2078,9 @@ export function emitTipShown(page: string, tip: string) {
 /** Fired when user's visit streak increments (consecutive days visiting) */
 export function emitStreakDay(streakCount: number) {
   send('ksc_streak_day', { streak_count: streakCount })
+}
+
+/** Fired when a user clicks a blog post link; `title` is the clicked post title */
+export function emitBlogPostClicked(title: string) {
+  send('ksc_blog_post_clicked', { blog_title: title })
 }

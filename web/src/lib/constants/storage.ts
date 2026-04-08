@@ -66,6 +66,12 @@ export const STORAGE_KEY_ADOPTER_NUDGE_DISMISSED = 'kc-adopter-nudge-dismissed'
 export const STORAGE_KEY_FIRST_AGENT_CONNECT = 'kc-first-agent-connect'
 export const STORAGE_KEY_VISIT_STREAK = 'ksc-visit-streak'
 export const STORAGE_KEY_SEEN_TIPS = 'ksc-seen-tips'
+export const STORAGE_KEY_NPS_STATE = 'kc-nps-state'
+
+// ── Orbit (Recurring Maintenance) ─────────────────────────────────
+export const STORAGE_KEY_ORBIT_MISSIONS = 'kc-orbit-missions'
+export const STORAGE_KEY_ORBIT_HISTORY = 'kc-orbit-history'
+export const STORAGE_KEY_GROUND_CONTROL_DASHBOARDS = 'kc-ground-control-dashboards'
 
 // ── Snooze persistence ────────────────────────────────────────────────
 export const STORAGE_KEY_SNOOZED_CARDS = 'kubestellar-snoozed-cards'

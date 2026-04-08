@@ -1100,10 +1100,36 @@ export function useCache<T>({
   // liveInDemoMode bypasses the demo check for cards backed by serverless functions
   const effectiveEnabled = enabled && (!demoMode || liveInDemoMode)
 
-  // Get or create cache store
-  const storeRef = useRef<CacheStore<T> | null>(null)
+  // Track mount state to distinguish initial mount from mode-switch re-fires.
+  // On initial mount / page navigation: fetch immediately (needed for data).
+  // On mode transition (enabled false→true after mount): skip immediate refetch,
+  // let triggerAllRefetches() handle it after the 500ms skeleton timer.
+  const hasMountedRef = useRef(false)
+  const prevEnabledRef = useRef(effectiveEnabled)
+  const initialFetchDoneRef = useRef(false)
 
-  if (!storeRef.current) {
+  // Track the auto-refresh timer in a ref to avoid thrashing (#5252).
+  // Without this, changing consecutiveFailures recreates the interval on every
+  // render, defeating the exponential backoff.
+  const autoRefreshTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // Get or create cache store.
+  // Track the key so we can reset the ref when the cache key changes
+  // (e.g., switching clusters). Without this, storeRef points to stale data (#5259).
+  const storeRef = useRef<CacheStore<T> | null>(null)
+  const storeKeyRef = useRef(key)
+
+  if (!storeRef.current || storeKeyRef.current !== key) {
+    // Key changed — clear the old auto-refresh timer so it doesn't keep
+    // polling the previous key (#5399), and reset the initial-fetch guard
+    // so the new key triggers an immediate fetch (#5400).
+    if (autoRefreshTimerRef.current) {
+      clearInterval(autoRefreshTimerRef.current)
+      autoRefreshTimerRef.current = null
+    }
+    initialFetchDoneRef.current = false
+
+    storeKeyRef.current = key
     storeRef.current = shared
       ? getOrCreateCache(key, initialData, persist)
       : new CacheStore(key, initialData, persist)
@@ -1143,14 +1169,6 @@ export function useCache<T>({
   const baseInterval = refreshInterval ?? REFRESH_RATES[category]
   const effectiveInterval = getEffectiveInterval(baseInterval, state.consecutiveFailures)
 
-  // Track mount state to distinguish initial mount from mode-switch re-fires.
-  // On initial mount / page navigation: fetch immediately (needed for data).
-  // On mode transition (enabled false→true after mount): skip immediate refetch,
-  // let triggerAllRefetches() handle it after the 500ms skeleton timer.
-  const hasMountedRef = useRef(false)
-  const prevEnabledRef = useRef(effectiveEnabled)
-  const initialFetchDoneRef = useRef(false)
-
   useEffect(() => {
     if (!effectiveEnabled) {
       // In demo/disabled mode, no fetch will run — mark loading as done
@@ -1158,6 +1176,11 @@ export function useCache<T>({
       hasMountedRef.current = true
       prevEnabledRef.current = effectiveEnabled
       initialFetchDoneRef.current = false
+      // Clear any pending auto-refresh timer
+      if (autoRefreshTimerRef.current) {
+        clearInterval(autoRefreshTimerRef.current)
+        autoRefreshTimerRef.current = null
+      }
       return
     }
 
@@ -1179,15 +1202,44 @@ export function useCache<T>({
     // Register for mode-transition refetches so triggerAllRefetches() reaches us
     const unregisterRefetch = registerRefetch(`cache:${key}`, refetch)
 
-    // Auto-refresh interval
-    // The interval restarts when consecutiveFailures changes (backoff kicks in).
-    // Suppressed when the dashboard "Auto" checkbox is unchecked (global pause).
+    // Auto-refresh interval — uses a ref-tracked timer to prevent thrashing.
+    // Only create a new timer if none is already pending (#5252).
     if (autoRefresh && !autoRefreshGloballyPaused) {
-      const intervalId = setInterval(() => { refetch().catch(() => { /* errors handled inside CacheStore.fetch */ }) }, effectiveInterval)
-      return () => { clearInterval(intervalId); unregisterRefetch() }
+      if (!autoRefreshTimerRef.current) {
+        autoRefreshTimerRef.current = setInterval(() => {
+          refetch().catch(() => { /* errors handled inside CacheStore.fetch */ })
+        }, effectiveInterval)
+      }
+    } else if (autoRefreshTimerRef.current) {
+      clearInterval(autoRefreshTimerRef.current)
+      autoRefreshTimerRef.current = null
     }
-    return () => unregisterRefetch()
-  }, [effectiveEnabled, autoRefresh, autoRefreshGloballyPaused, effectiveInterval, refetch, store, key, state.consecutiveFailures])
+
+    return () => {
+      unregisterRefetch()
+    }
+  }, [effectiveEnabled, autoRefresh, autoRefreshGloballyPaused, refetch, store, key])
+
+  // Restart the auto-refresh timer when the backoff interval changes.
+  // Separated from the main effect to avoid re-running mount/mode-transition logic (#5252).
+  useEffect(() => {
+    if (!autoRefreshTimerRef.current || !autoRefresh || autoRefreshGloballyPaused) return
+    // Clear old timer and create a new one with updated interval
+    clearInterval(autoRefreshTimerRef.current)
+    autoRefreshTimerRef.current = setInterval(() => {
+      refetch().catch(() => { /* errors handled inside CacheStore.fetch */ })
+    }, effectiveInterval)
+  }, [effectiveInterval, autoRefresh, autoRefreshGloballyPaused, refetch])
+
+  // Clean up auto-refresh timer on unmount
+  useEffect(() => {
+    return () => {
+      if (autoRefreshTimerRef.current) {
+        clearInterval(autoRefreshTimerRef.current)
+        autoRefreshTimerRef.current = null
+      }
+    }
+  }, [])
 
   // Cleanup non-shared stores on unmount
   useEffect(() => {

@@ -32,6 +32,7 @@ vi.mock('../../useLocalAgent', () => ({
 
 vi.mock('../shared', () => ({
   LOCAL_AGENT_URL: 'http://localhost:8585',
+  agentFetch: (...args: unknown[]) => fetch(...(args as Parameters<typeof fetch>)),
   clusterCacheRef: mockClusterCacheRef,
 }))
 
@@ -764,9 +765,9 @@ describe('fetcher callback — agentFetchAllClusters', () => {
     renderHook(() => useKagentCRDTools())
 
     expect(capturedFetcher).toBeDefined()
-    const result = await capturedFetcher!()
-    // agentFetch returns null on non-ok => throws 'No data' => rejected => filtered out
-    expect(result).toEqual([])
+    // agentFetch now throws on non-ok response; when all clusters fail,
+    // agentFetchAllClusters re-throws with an aggregate error
+    await expect(capturedFetcher!()).rejects.toThrow('All kagent CRD fetches failed')
   })
 
   it('agentFetch returns null when fetch throws (network error)', async () => {
@@ -806,8 +807,9 @@ describe('fetcher callback — agentFetchAllClusters', () => {
     renderHook(() => useKagentCRDModels())
 
     expect(capturedFetcher).toBeDefined()
-    const result = await capturedFetcher!()
-    expect(result).toEqual([])
+    // agentFetch now throws on network error; when all clusters fail,
+    // agentFetchAllClusters re-throws with an aggregate error
+    await expect(capturedFetcher!()).rejects.toThrow('All kagent CRD fetches failed')
   })
 })
 
@@ -1151,10 +1153,9 @@ describe('agentFetch — abort timeout behavior', () => {
     renderHook(() => useKagentCRDModels())
 
     expect(capturedFetcher).toBeDefined()
-    const result = await capturedFetcher!()
-
-    // Should still work — catch block returns null, which causes 'No data' throw
-    expect(result).toEqual([])
+    // agentFetch now re-throws on failure; when all clusters fail,
+    // agentFetchAllClusters throws an aggregate error
+    await expect(capturedFetcher!()).rejects.toThrow('All kagent CRD fetches failed')
     expect(clearTimeoutSpy).toHaveBeenCalled()
     clearTimeoutSpy.mockRestore()
   })

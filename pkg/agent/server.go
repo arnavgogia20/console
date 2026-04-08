@@ -42,6 +42,13 @@ const (
 	// missions from staying in "Running/Processing" state indefinitely when the
 	// AI provider hangs or never responds (#2375).
 	missionExecutionTimeout = 5 * time.Minute
+
+	// missionHeartbeatInterval is how often the backend sends a heartbeat
+	// progress event during mission execution.  This prevents the frontend's
+	// stream-inactivity timer (90s) from firing during legitimate long-running
+	// tool calls (e.g., `drasi init`, `helm install`) that produce no output
+	// for extended periods.
+	missionHeartbeatInterval = 30 * time.Second
 )
 
 // Version is set by ldflags during build
@@ -173,6 +180,8 @@ func NewServer(cfg Config) (*Server, error) {
 	agentToken := os.Getenv("KC_AGENT_TOKEN")
 	if agentToken != "" {
 		slog.Info("Agent token authentication enabled")
+	} else {
+		slog.Warn("KC_AGENT_TOKEN is not set — all requests will be accepted without authentication. Set KC_AGENT_TOKEN to enable token validation.")
 	}
 
 	now := time.Now()
@@ -580,6 +589,11 @@ func (s *Server) handleProviderCheck(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization")
 		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if !s.validateToken(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
