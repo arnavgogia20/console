@@ -4,6 +4,11 @@ export interface ClusterInfo {
   server?: string
   user?: string
   healthy?: boolean
+  /** True when no health probe has returned yet (initial state). #5921/#5924 */
+  healthUnknown?: boolean
+  /** True when every health probe since startup has failed — used to drive
+   *  the stale-kubeconfig warning banner (#5921). */
+  neverConnected?: boolean
   source?: string
   nodeCount?: number
   podCount?: number
@@ -170,6 +175,39 @@ export interface Deployment {
   annotations?: Record<string, string>
 }
 
+/**
+ * Tri-state metric value (issue #6113).
+ *
+ * Frontend code has historically conflated three very different situations into
+ * a single numeric 0: (a) the upstream returned "zero", (b) the upstream hasn't
+ * returned yet, and (c) the upstream doesn't know / isn't exposing this metric.
+ * This enum lets callers disambiguate explicitly.
+ *
+ * v1 use-site: see `AggregatedMetricCompleteness` below and
+ * `useClusters().metricsCompleteness`. A fuller migration of every card to
+ * tri-state values is tracked as follow-up work.
+ */
+export type MetricState = 'loading' | 'unknown' | 'value'
+
+export interface TriStateMetric<T = number> {
+  state: MetricState
+  value?: T
+}
+
+/**
+ * Metadata describing the completeness of an aggregated metric computed across
+ * multiple clusters (issue #6114). `contributingClusters` is the list of
+ * cluster names whose data was included in the aggregate, and `missingClusters`
+ * lists cluster names that should have contributed but didn't (unreachable,
+ * metrics-server unavailable, fetch error, etc.). `isComplete` is true only
+ * when `missingClusters` is empty.
+ */
+export interface AggregatedMetricCompleteness {
+  contributingClusters: string[]
+  missingClusters: string[]
+  isComplete: boolean
+}
+
 // AcceleratorType represents the category of accelerator
 export type AcceleratorType = 'GPU' | 'TPU' | 'AIU' | 'XPU'
 
@@ -297,6 +335,19 @@ export interface NodeInfo {
   unschedulable: boolean
 }
 
+/** Structured view of a ServicePort that preserves the port name
+ * (issue #6163). Matches pkg/k8s.ServicePortDetail. */
+export interface ServicePortDetail {
+  /** Optional name from the k8s ServicePort (e.g. "http", "metrics"). */
+  name?: string
+  /** Service-level port number. */
+  port: number
+  /** TCP / UDP / SCTP. */
+  protocol?: string
+  /** Externally exposed port for NodePort / LoadBalancer services. */
+  nodePort?: number
+}
+
 export interface Service {
   name: string
   namespace: string
@@ -304,7 +355,22 @@ export interface Service {
   type: string // ClusterIP, NodePort, LoadBalancer, ExternalName
   clusterIP?: string
   externalIP?: string
+  /** Legacy flat representation ("80/TCP" or "80:30080/TCP"). */
   ports?: string[]
+  /** Structured ports with optional names (issue #6163). Same order as `ports`. */
+  portDetails?: ServicePortDetail[]
+  // Number of ready backend addresses (pods) currently associated with this
+  // service via its core/v1 Endpoints object. Issue #6150: the Endpoints
+  // dashboard stat sums this across services rather than counting services.
+  endpoints?: number
+  // LoadBalancer provisioning state. Empty string for non-LoadBalancer
+  // services. 'Provisioning' when a LoadBalancer service has no ingress
+  // IP/hostname yet, 'Ready' when it does. Issue #6153.
+  lbStatus?: string
+  /** Label selector for backing pods. Used to detect orphaned services
+   * (issue #6164) and invalid empty selectors on non-ExternalName services
+   * (issue #6166). */
+  selector?: Record<string, string>
   age?: string
   labels?: Record<string, string>
   annotations?: Record<string, string>

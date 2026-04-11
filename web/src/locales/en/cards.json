@@ -152,6 +152,7 @@
     "warning_events": "Warning Events",
     "recent_events": "Recent Events",
     "events_timeline": "Events Timeline",
+    "pod_logs": "Pod Logs",
     "pod_health_trend": "Pod Health Trend",
     "resource_trend": "Resource Trend",
     "storage_overview": "Storage Overview",
@@ -321,6 +322,7 @@
     "warning_events": "Warning-level events that may need attention.",
     "recent_events": "Most recent events across all clusters.",
     "events_timeline": "Timeline chart of event frequency over time.",
+    "pod_logs": "Tail container logs for any pod across your clusters.",
     "pod_health_trend": "Historical trend of pod health status over time.",
     "resource_trend": "Resource usage trends showing CPU and memory over time.",
     "storage_overview": "Persistent volume and storage class overview.",
@@ -680,7 +682,13 @@
     "dry": "DRY",
     "run": "Run",
     "running": "Running...",
-    "listPods": "List Pods"
+    "listPods": "List Pods",
+    "terminalReady": "kubectl terminal ready. Type commands or use AI assistant.",
+    "examples": "Examples:",
+    "exampleGetPods": "get pods",
+    "exampleGetDeployments": "get deployments",
+    "exampleDescribePod": "describe pod <name>",
+    "exampleLogs": "logs <pod-name>"
   },
   "clusterGroups": {
     "createGroup": "Create Group",
@@ -1780,7 +1788,8 @@
       "activeGpuReservations": "Active GPU Reservations",
       "durationHours": "{{hours}}h duration",
       "noReservationsUser": "No reservations found for your user.",
-      "noReservationsYet": "No GPU reservations yet. Click \"Create GPU Reservation\" to get started."
+      "noReservationsYet": "No GPU reservations yet. Click \"Create GPU Reservation\" to get started.",
+      "noReservationsYetShort": "No GPU reservations yet."
     },
     "calendar": {
       "previousMonth": "Previous month",
@@ -3338,5 +3347,35 @@
     "previewName": "Name",
     "previewNamespace": "Namespace",
     "previewImage": "Image"
+  },
+  "dynamicCard": {
+    "missingConfig": "Missing card configuration.",
+    "noDynamicCardId": "No dynamicCardId was provided in the card config.",
+    "notFound": "Dynamic card \"{{id}}\" not found.",
+    "notFoundHint": "The card definition may have been deleted or not loaded yet.",
+    "invalidDefinition": "Invalid card definition: missing {{missing}}.",
+    "cardDefinition": "card definition",
+    "sourceCode": "source code",
+    "noDataAvailable": "No data available.",
+    "invalidCardConfig": "Invalid card configuration",
+    "invalidCardConfigHint": "The card definition is missing or malformed.",
+    "missingEndpoint": "Missing API endpoint",
+    "missingEndpointHint": "This card is configured to use API data but no apiEndpoint is specified.",
+    "fetchFailed": "Failed to fetch data",
+    "compiling": "Compiling card...",
+    "compilationError": "Compilation Error",
+    "noComponent": "No component produced."
+  },
+  "issueActivityChart": {
+    "title": "Daily Issues & PRs",
+    "description": "Issues opened vs closed and PRs merged per day",
+    "opened": "Opened",
+    "closed": "Closed",
+    "prsMerged": "PRs Merged",
+    "merged": "Merged",
+    "issues": "Issues",
+    "prs": "PRs",
+    "refresh": "Refresh",
+    "showingDemo": "showing demo data"
   }
 }

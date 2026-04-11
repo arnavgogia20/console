@@ -4,19 +4,20 @@ on:
   check_run:
     types: [completed]
 
-permissions:
-  contents: read
-  pull-requests: write
-  issues: write
-  statuses: write
+permissions: read-all
 
 jobs:
   handle-build-failure:
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
     if: false # Copilot disabled — issues handled by Claude Code scanner
     runs-on: ubuntu-latest
     steps:
       - name: Handle Netlify Failure
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const prs = context.payload.check_run.pull_requests;

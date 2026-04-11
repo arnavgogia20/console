@@ -1,6 +1,9 @@
 package handlers
 
 import (
+	"encoding/json"
+	"errors"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 
@@ -8,6 +11,12 @@ import (
 	"github.com/kubestellar/console/pkg/models"
 	"github.com/kubestellar/console/pkg/store"
 )
+
+// MaxCardsPerDashboard is the hard limit on the number of cards a single
+// dashboard may contain. The limit prevents runaway client scripts (or a
+// compromised session) from exhausting the database by creating unlimited
+// cards via the API (#5999).
+const MaxCardsPerDashboard = 200
 
 // CardHandler handles card operations
 type CardHandler struct {
@@ -18,6 +27,47 @@ type CardHandler struct {
 // NewCardHandler creates a new card handler
 func NewCardHandler(s store.Store, hub *Hub) *CardHandler {
 	return &CardHandler{store: s, hub: hub}
+}
+
+// requireEditorOrAdmin verifies the requesting user has at least the editor
+// role. Viewers must not be able to create, update, or delete dashboard cards
+// via the API (#5999). If no user store is configured (dev/demo mode) the
+// check is skipped.
+//
+// Error mapping (#6010): a store lookup failure returns 500 — the caller is
+// not necessarily unauthorized, the backend is broken. Only a successful
+// lookup that returns no user (or a user with insufficient role) yields 403.
+func (h *CardHandler) requireEditorOrAdmin(c *fiber.Ctx) error {
+	if h.store == nil {
+		return nil
+	}
+	userID := middleware.GetUserID(c)
+	user, err := h.store.GetUser(userID)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "Failed to verify user role")
+	}
+	if user == nil {
+		return fiber.NewError(fiber.StatusForbidden, "User not found")
+	}
+	if user.Role != models.UserRoleAdmin && user.Role != models.UserRoleEditor {
+		return fiber.NewError(fiber.StatusForbidden, "Editor or admin role required to modify cards")
+	}
+	return nil
+}
+
+// isValidCardType reports whether the supplied card type is in the set of
+// types registered by models.GetCardTypes. Used by both CreateCard and
+// UpdateCard (#6010) to reject garbage input before touching the store.
+func isValidCardType(t models.CardType) bool {
+	if t == "" {
+		return false
+	}
+	for _, known := range models.GetCardTypes() {
+		if known.Type == t {
+			return true
+		}
+	}
+	return false
 }
 
 // ListCards returns all cards for a dashboard
@@ -46,6 +96,12 @@ func (h *CardHandler) ListCards(c *fiber.Ctx) error {
 
 // CreateCard creates a new card
 func (h *CardHandler) CreateCard(c *fiber.Ctx) error {
+	// Role check must run before any data access (#5999). Viewers cannot
+	// create cards; only editors and admins may.
+	if err := h.requireEditorOrAdmin(c); err != nil {
+		return err
+	}
+
 	userID := middleware.GetUserID(c)
 	dashboardID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -62,21 +118,39 @@ func (h *CardHandler) CreateCard(c *fiber.Ctx) error {
 	}
 
 	var input struct {
-		CardType models.CardType      `json:"card_type"`
-		Config   map[string]any       `json:"config"`
-		Position models.CardPosition  `json:"position"`
+		CardType models.CardType     `json:"card_type"`
+		Config   json.RawMessage     `json:"config"`
+		Position models.CardPosition `json:"position"`
 	}
 	if err := c.BodyParser(&input); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "Invalid request body")
 	}
 
+	// Validate card type against the registered set — reject empty or
+	// unknown types so the store never sees garbage input (#5999).
+	if input.CardType == "" {
+		return fiber.NewError(fiber.StatusBadRequest, "card_type is required")
+	}
+	if !isValidCardType(input.CardType) {
+		return fiber.NewError(fiber.StatusBadRequest, "Unknown card_type")
+	}
+
 	card := &models.Card{
 		DashboardID: dashboardID,
 		CardType:    input.CardType,
+		Config:      input.Config,
 		Position:    input.Position,
 	}
 
-	if err := h.store.CreateCard(card); err != nil {
+	// Enforce the per-dashboard card limit (#5999) and the insert atomically
+	// via CreateCardWithLimit to close the TOCTOU race where concurrent
+	// creates could both observe count == MaxCardsPerDashboard-1 and both
+	// succeed (#6010).
+	if err := h.store.CreateCardWithLimit(card, MaxCardsPerDashboard); err != nil {
+		if errors.Is(err, store.ErrDashboardCardLimitReached) {
+			return fiber.NewError(fiber.StatusTooManyRequests,
+				"Dashboard card limit reached")
+		}
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to create card")
 	}
 
@@ -91,6 +165,10 @@ func (h *CardHandler) CreateCard(c *fiber.Ctx) error {
 
 // UpdateCard updates a card
 func (h *CardHandler) UpdateCard(c *fiber.Ctx) error {
+	// Role check must run before any data access (#5999).
+	if err := h.requireEditorOrAdmin(c); err != nil {
+		return err
+	}
 	userID := middleware.GetUserID(c)
 	cardID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -113,14 +191,28 @@ func (h *CardHandler) UpdateCard(c *fiber.Ctx) error {
 
 	var input struct {
 		CardType *models.CardType     `json:"card_type"`
+		Config   *json.RawMessage     `json:"config"`
 		Position *models.CardPosition `json:"position"`
 	}
 	if err := c.BodyParser(&input); err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "Invalid request body")
 	}
 
+	// Validate card_type if the caller supplied one — reject unknown types
+	// so the store never sees garbage input (#6010). Matches the CreateCard
+	// validation to prevent viewers or buggy clients from writing bogus
+	// types via the update path.
 	if input.CardType != nil {
+		if !isValidCardType(*input.CardType) {
+			return fiber.NewError(fiber.StatusBadRequest, "Unknown card_type")
+		}
 		card.CardType = *input.CardType
+	}
+	// Accept config updates — the SQLite UpdateCard already persists
+	// card.Config, but the handler previously ignored the field on the
+	// wire and only card_type/position would ever be written (#6010).
+	if input.Config != nil {
+		card.Config = *input.Config
 	}
 	if input.Position != nil {
 		card.Position = *input.Position
@@ -141,6 +233,10 @@ func (h *CardHandler) UpdateCard(c *fiber.Ctx) error {
 
 // DeleteCard deletes a card
 func (h *CardHandler) DeleteCard(c *fiber.Ctx) error {
+	// Role check must run before any data access (#5999).
+	if err := h.requireEditorOrAdmin(c); err != nil {
+		return err
+	}
 	userID := middleware.GetUserID(c)
 	cardID, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -241,6 +337,10 @@ func (h *CardHandler) GetHistory(c *fiber.Ctx) error {
 
 // MoveCard moves a card to a different dashboard
 func (h *CardHandler) MoveCard(c *fiber.Ctx) error {
+	// Role check must run before any data access (#5999).
+	if err := h.requireEditorOrAdmin(c); err != nil {
+		return err
+	}
 	userID := middleware.GetUserID(c)
 	cardID, err := uuid.Parse(c.Params("id"))
 	if err != nil {

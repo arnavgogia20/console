@@ -42,17 +42,18 @@ env:
   ASSIGN_COPILOT: 'false'  # Set to 'true' to auto-assign Copilot to created issues
   COPILOT_ASSIGNMENT_DELAY_S: 120  # Seconds between Copilot assignments to avoid rate limiting
   ISSUE_PREFIX: "[Auto-QA]"
-  NODE_VERSION: "20"
-  GO_VERSION: "1.23"
+  NODE_VERSION: "22"
+  GO_VERSION: "1.25"
 
-permissions:
-  contents: write      # Copilot needs write access to create branches
-  issues: write
-  pull-requests: write # Copilot needs to create PRs
-  actions: read        # Copilot needs to view workflow status
+permissions: read-all
 
 jobs:
   auto-qa:
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -3437,7 +3438,7 @@ jobs:
       # ── Issue Creation ──────────────────────────────────────────────
 
       - name: Create issues for failures
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           BUILD_OUTCOME: ${{ steps.build_check.outcome }}
           LINT_OUTCOME: ${{ steps.lint_check.outcome }}

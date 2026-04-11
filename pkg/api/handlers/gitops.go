@@ -22,6 +22,7 @@ import (
 	"github.com/kubestellar/console/pkg/api/v1alpha1"
 	"github.com/kubestellar/console/pkg/k8s"
 	"github.com/kubestellar/console/pkg/mcp"
+	"github.com/kubestellar/console/pkg/store"
 )
 
 // Maximum number of concurrent helm/kubectl subprocesses across all handlers.
@@ -47,18 +48,105 @@ type GitOpsDrift struct {
 	Severity   string `json:"severity"` // low, medium, high
 }
 
+// driftCacheTTL bounds how long a DetectDrift result stays in the shared
+// cache feeding ListDrifts. Long enough to be useful across a dashboard
+// render cycle, short enough that manual refreshes (#5952) actually see
+// fresh data rather than a stale repeat.
+const driftCacheTTL = 30 * time.Second
+
+// driftCacheEntry is a single cached drift-detection result keyed by
+// repo/path/cluster/namespace.
+type driftCacheEntry struct {
+	drifts   []GitOpsDrift
+	detected time.Time
+}
+
 // GitOpsHandlers handles GitOps-related API endpoints
 type GitOpsHandlers struct {
 	bridge    *mcp.Bridge
 	k8sClient *k8s.MultiClusterClient
+	// userStore is consulted by the shared requireEditorOrAdmin /
+	// requireViewerOrAbove helpers to enforce RBAC on GitOps endpoints
+	// (#6022). May be nil in dev/demo mode or in unit tests that don't
+	// exercise RBAC; in that case the check is a no-op to preserve existing
+	// test ergonomics.
+	userStore store.Store
+
+	// driftCache memoises recent drift results so ListDrifts can return
+	// something meaningful (#5950). Populated by DetectDrift.
+	driftCacheMu sync.RWMutex
+	driftCache   map[string]driftCacheEntry
 }
 
-// NewGitOpsHandlers creates a new GitOps handlers instance
-func NewGitOpsHandlers(bridge *mcp.Bridge, k8sClient *k8s.MultiClusterClient) *GitOpsHandlers {
+// NewGitOpsHandlers creates a new GitOps handlers instance.
+//
+// userStore is used to enforce editor-or-admin on mutating GitOps endpoints
+// (sync, helm mutations, argocd sync) and viewer-or-above on drift detection
+// (#6022). Pass nil to skip role checks — this is intended for dev/demo mode
+// and unit tests that are not exercising RBAC.
+func NewGitOpsHandlers(bridge *mcp.Bridge, k8sClient *k8s.MultiClusterClient, userStore store.Store) *GitOpsHandlers {
 	return &GitOpsHandlers{
-		bridge:    bridge,
-		k8sClient: k8sClient,
+		bridge:     bridge,
+		k8sClient:  k8sClient,
+		userStore:  userStore,
+		driftCache: make(map[string]driftCacheEntry),
 	}
+}
+
+// RBAC for GitOps endpoints is enforced via the shared helpers in
+// auth_helpers.go (requireEditorOrAdmin / requireViewerOrAbove). The earlier
+// admin-only helper was removed in #6022 when the policy was loosened to
+// editor-or-admin for mutations and viewer-or-above for drift detection.
+
+// rememberDrift stores a drift-detection result in the in-memory cache keyed
+// by repo URL / path / cluster / namespace. Safe for concurrent use.
+func (h *GitOpsHandlers) rememberDrift(req DetectDriftRequest, result *DetectDriftResponse) {
+	if result == nil {
+		return
+	}
+	key := fmt.Sprintf("%s|%s|%s|%s", req.RepoURL, req.Path, req.Cluster, req.Namespace)
+	drifts := make([]GitOpsDrift, 0, len(result.Resources))
+	if result.Drifted {
+		for _, r := range result.Resources {
+			drifts = append(drifts, GitOpsDrift{
+				Resource:  r.Name,
+				Namespace: r.Namespace,
+				Cluster:   req.Cluster,
+				Kind:      r.Kind,
+				DriftType: "modified",
+				Details:   fmt.Sprintf("%s: %s", r.Field, r.DiffOutput),
+				Severity:  "medium",
+			})
+		}
+	}
+	h.driftCacheMu.Lock()
+	defer h.driftCacheMu.Unlock()
+	h.driftCache[key] = driftCacheEntry{drifts: drifts, detected: time.Now()}
+}
+
+// snapshotDrifts returns all cached drifts matching the optional
+// cluster/namespace filter, dropping entries older than driftCacheTTL.
+func (h *GitOpsHandlers) snapshotDrifts(cluster, namespace string) []GitOpsDrift {
+	now := time.Now()
+	h.driftCacheMu.Lock()
+	defer h.driftCacheMu.Unlock()
+	out := make([]GitOpsDrift, 0)
+	for k, entry := range h.driftCache {
+		if now.Sub(entry.detected) > driftCacheTTL {
+			delete(h.driftCache, k)
+			continue
+		}
+		for _, d := range entry.drifts {
+			if cluster != "" && d.Cluster != cluster {
+				continue
+			}
+			if namespace != "" && d.Namespace != namespace {
+				continue
+			}
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // DriftedResource represents a resource that has drifted from git
@@ -157,16 +245,19 @@ type Operator struct {
 	Cluster     string `json:"cluster,omitempty"`
 }
 
-// ListDrifts returns a list of detected drifts (for GET endpoint)
+// ListDrifts returns a list of detected drifts (for GET endpoint).
+//
+// #5950 — Previously this always returned an empty slice, so the UI drift
+// card never showed anything. We now expose drift results cached from recent
+// DetectDrift calls (see rememberDrift) filtered by the optional query
+// params. Entries older than driftCacheTTL are evicted on read.
 func (h *GitOpsHandlers) ListDrifts(c *fiber.Ctx) error {
-	// Optional query params for filtering
-	// cluster := c.Query("cluster")
-	// namespace := c.Query("namespace")
+	cluster := c.Query("cluster")
+	namespace := c.Query("namespace")
 
-	// Return empty list - actual drift detection requires specific repo/path
-	// which should be done via POST /api/gitops/detect-drift
+	drifts := h.snapshotDrifts(cluster, namespace)
 	return c.JSON(fiber.Map{
-		"drifts": []GitOpsDrift{},
+		"drifts": drifts,
 	})
 }
 
@@ -987,6 +1078,15 @@ func getDemoHelmReleasesForStreaming() []HelmRelease {
 
 // DetectDrift detects drift between git and cluster state
 func (h *GitOpsHandlers) DetectDrift(c *fiber.Ctx) error {
+	// #6022 — drift detection is read-oriented (it diffs git vs. live cluster)
+	// so it is gated as "viewer-or-above" rather than admin-only. This still
+	// blocks anonymous/unknown callers and any user who isn't registered in
+	// the console user store, but allows editors and viewers to see drift
+	// reports without needing the admin role.
+	if err := requireViewerOrAbove(c, h.userStore); err != nil {
+		return err
+	}
+
 	var req DetectDriftRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
@@ -1003,6 +1103,7 @@ func (h *GitOpsHandlers) DetectDrift(c *fiber.Ctx) error {
 	if h.bridge != nil {
 		result, err := h.detectDriftViaMCP(ctx, req)
 		if err == nil {
+			h.rememberDrift(req, result)
 			return c.JSON(result)
 		}
 		slog.Error("[GitOps] MCP detect_drift failed, falling back to kubectl", "error", err)
@@ -1011,10 +1112,50 @@ func (h *GitOpsHandlers) DetectDrift(c *fiber.Ctx) error {
 	// Fall back to kubectl diff
 	result, err := h.detectDriftViaKubectl(ctx, req)
 	if err != nil {
+		// #5959 — Invalid YAML in the GitOps repo was previously masked as a
+		// generic "internal error". Surface a structured parse error with the
+		// raw kubectl stderr so users can fix their manifests.
+		if yamlErr := extractYAMLParseError(err); yamlErr != "" {
+			return c.Status(422).JSON(fiber.Map{
+				"error":     "invalid YAML in GitOps source",
+				"errorType": "yaml_parse",
+				"details":   yamlErr,
+			})
+		}
 		return handleK8sError(c, err)
 	}
 
+	h.rememberDrift(req, result)
 	return c.JSON(result)
+}
+
+// extractYAMLParseError pattern-matches kubectl/yaml parser error messages
+// and returns a cleaned-up description, or "" if the error does not look
+// like a YAML parse problem. Keeps detail enough to be actionable (file,
+// line, reason) without leaking paths outside the manifest set.
+func extractYAMLParseError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	lower := strings.ToLower(msg)
+	yamlMarkers := []string{
+		"error parsing",
+		"yaml: line",
+		"yaml: unmarshal",
+		"error converting yaml",
+		"error validating data",
+		"mapping values are not allowed",
+		"did not find expected",
+		"could not find expected",
+		"found character that cannot start any token",
+	}
+	for _, m := range yamlMarkers {
+		if strings.Contains(lower, m) {
+			return msg
+		}
+	}
+	return ""
 }
 
 // detectDriftViaMCP uses the kubestellar-ops detect_drift tool
@@ -1158,6 +1299,15 @@ func (h *GitOpsHandlers) detectDriftViaKubectl(ctx context.Context, req DetectDr
 
 // Sync applies manifests from git to the cluster
 func (h *GitOpsHandlers) Sync(c *fiber.Ctx) error {
+	// #6022 — GitOps sync mutates cluster state via kubectl apply (or MCP
+	// deploy). Viewers must be blocked, but editors are expected to drive
+	// day-to-day sync operations so the gate is editor-or-admin (not
+	// admin-only). Anonymous callers and users missing from the store are
+	// rejected with 403 by the shared helper.
+	if err := requireEditorOrAdmin(c, h.userStore); err != nil {
+		return err
+	}
+
 	var req SyncRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
@@ -1837,6 +1987,10 @@ type HelmUpgradeRequest struct {
 
 // RollbackHelmRelease rolls back a Helm release to a specific revision
 func (h *GitOpsHandlers) RollbackHelmRelease(c *fiber.Ctx) error {
+	// Helm rollback mutates cluster state; gated as editor-or-admin (#6022).
+	if err := requireEditorOrAdmin(c, h.userStore); err != nil {
+		return err
+	}
 	var req HelmRollbackRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
@@ -1889,6 +2043,10 @@ func (h *GitOpsHandlers) RollbackHelmRelease(c *fiber.Ctx) error {
 
 // UninstallHelmRelease uninstalls a Helm release
 func (h *GitOpsHandlers) UninstallHelmRelease(c *fiber.Ctx) error {
+	// Helm uninstall destroys cluster resources; gated as editor-or-admin (#6022).
+	if err := requireEditorOrAdmin(c, h.userStore); err != nil {
+		return err
+	}
 	var req HelmUninstallRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
@@ -1938,6 +2096,10 @@ func (h *GitOpsHandlers) UninstallHelmRelease(c *fiber.Ctx) error {
 
 // UpgradeHelmRelease upgrades a Helm release
 func (h *GitOpsHandlers) UpgradeHelmRelease(c *fiber.Ctx) error {
+	// Helm upgrade mutates cluster state; gated as editor-or-admin (#6022).
+	if err := requireEditorOrAdmin(c, h.userStore); err != nil {
+		return err
+	}
 	var req HelmUpgradeRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
@@ -2170,11 +2332,12 @@ func (h *GitOpsHandlers) GetArgoSyncSummary(c *fiber.Ctx) error {
 // Tries ArgoCD REST API first (if ARGOCD_AUTH_TOKEN is set), then CLI, then annotation patching.
 // POST /api/gitops/argocd/sync
 func (h *GitOpsHandlers) TriggerArgoSync(c *fiber.Ctx) error {
-	if h.k8sClient == nil {
-		return c.Status(503).JSON(fiber.Map{
-			"error":   "Kubernetes client not configured",
-			"success": false,
-		})
+	// #6022 — ArgoCD sync forces reconciliation against the target cluster
+	// and is equivalent to any other mutating sync operation. Gated as
+	// editor-or-admin: editors drive routine sync operations, viewers are
+	// blocked because they should only observe state, not force changes.
+	if err := requireEditorOrAdmin(c, h.userStore); err != nil {
+		return err
 	}
 
 	var req struct {
@@ -2189,6 +2352,10 @@ func (h *GitOpsHandlers) TriggerArgoSync(c *fiber.Ctx) error {
 		})
 	}
 
+	// Body-shape validation runs BEFORE the k8s client availability check
+	// so RBAC + body-shape errors surface to the caller even when the
+	// cluster connection is unavailable. Mirrors the Sync /
+	// UpgradeHelmRelease ordering and is what the #6022 RBAC tests assume.
 	if req.AppName == "" || req.Cluster == "" {
 		return c.Status(400).JSON(fiber.Map{
 			"error":   "appName and cluster are required",
@@ -2201,6 +2368,13 @@ func (h *GitOpsHandlers) TriggerArgoSync(c *fiber.Ctx) error {
 	}
 	if err := validateK8sName(req.Cluster, "cluster"); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": err.Error(), "success": false})
+	}
+
+	if h.k8sClient == nil {
+		return c.Status(503).JSON(fiber.Map{
+			"error":   "Kubernetes client not configured",
+			"success": false,
+		})
 	}
 
 	// Default namespace for ArgoCD applications

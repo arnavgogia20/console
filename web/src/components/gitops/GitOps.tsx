@@ -28,15 +28,25 @@ interface GitOpsAppConfig {
 }
 
 // GitOps app with detected status
+// #6156 — 'error' is a distinct status so failed drift checks render as an
+// error (not a false-positive "synced + healthy").
 interface GitOpsApp extends GitOpsAppConfig {
-  syncStatus: 'synced' | 'out-of-sync' | 'unknown' | 'checking'
-  healthStatus: 'healthy' | 'degraded' | 'progressing' | 'missing'
+  syncStatus: 'synced' | 'out-of-sync' | 'unknown' | 'checking' | 'error'
+  healthStatus: 'healthy' | 'degraded' | 'progressing' | 'missing' | 'unknown'
+  // #6157 — marks apps whose cluster could not be resolved unambiguously
+  clusterAmbiguous?: boolean
   lastSyncTime?: string
   driftDetails?: string[]
 }
 
 // Drift detection result from API
+// #6156 — `status` explicitly captures the outcome so the UI never treats an
+// error as "not drifted". 'ok' = detection ran and returned a result; 'error'
+// = detection failed (network error, backend down, parsing error, etc.).
+type DriftStatus = 'ok' | 'error'
+
 interface DriftResult {
+  status: DriftStatus
   drifted: boolean
   resources: Array<{
     kind: string
@@ -91,7 +101,11 @@ export function GitOps() {
   const [syncedApps, setSyncedApps] = useState<Set<string>>(new Set())
   const [syncDialogApp, setSyncDialogApp] = useState<GitOpsApp | null>(null)
   const [driftResults, setDriftResults] = useState<Map<string, DriftResult>>(new Map())
-  const [isDetecting, setIsDetecting] = useState(true)
+  // #6155 — isDetecting starts `false`. The effect below flips it to `true`
+  // only when a real detection pass is about to run (non-demo mode AND
+  // backend healthy). Previously it defaulted to `true` and demo mode never
+  // cleared it, leaving every card stuck in "checking".
+  const [isDetecting, setIsDetecting] = useState(false)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
 
   // Cache helm releases count to prevent showing 0 during refresh
@@ -102,8 +116,41 @@ export function GitOps() {
     setLastUpdated(new Date())
   }, [])
 
+  // Health-check timeout for skipping drift detection when the backend is
+  // unreachable — long enough to survive a slow initial auth round-trip,
+  // short enough that users don't stare at "checking" for seconds (#3609).
+  const DRIFT_HEALTHCHECK_TIMEOUT_MS = 3000
+
+  // #6157 — Cluster resolution. Previously every app with an empty preferred
+  // cluster silently fell back to `clusters[0]`, making multi-cluster
+  // attribution wrong (every app appeared to target the first cluster).
+  //
+  // New semantics:
+  //   - If `preferred` is set, use it verbatim (explicit).
+  //   - If there is exactly one cluster available, use it (unambiguous).
+  //   - Otherwise return `{ cluster: '', ambiguous: true }` so the UI can
+  //     render the entry as "cluster: unknown" instead of silently picking
+  //     one. This preserves the display shape used by the <select> (context
+  //     || name.split('/').pop()).
+  const EXACTLY_ONE_CLUSTER = 1
+  const clusterDisplayName = (c: { context?: string; name: string }): string =>
+    c.context || c.name.split('/').pop() || ''
+  const resolveAppCluster = (preferred: string): { cluster: string; ambiguous: boolean } => {
+    if (preferred) return { cluster: preferred, ambiguous: false }
+    if (clusters.length === EXACTLY_ONE_CLUSTER) {
+      return { cluster: clusterDisplayName(clusters[0]), ambiguous: false }
+    }
+    return { cluster: '', ambiguous: clusters.length > EXACTLY_ONE_CLUSTER }
+  }
+
+  // #5952 — detectAllDrift is now a callable ref so the refresh button can
+  // re-run drift detection instead of only updating lastUpdated.
+  const detectAllDriftRef = useRef<() => Promise<void>>(async () => {})
+
   const handleRefresh = () => {
     refetch()
+    // Re-run drift detection so the UI actually reflects fresh state.
+    void detectAllDriftRef.current()
     setLastUpdated(new Date())
   }
 
@@ -111,14 +158,21 @@ export function GitOps() {
   // Guard: verify backend is reachable first to avoid slow sequential failures
   // that block the UI and add latency (#3609).
   useEffect(() => {
-    if (getDemoMode()) return
+    // #6155 — In demo mode there is no backend; ensure isDetecting is false
+    // so cards do not stay stuck in the "checking" state forever. This uses
+    // the SAME setter the real exit path uses, rather than silently
+    // returning and leaving the previous value in place.
+    if (getDemoMode()) {
+      setIsDetecting(false)
+      return
+    }
 
     let cancelled = false
 
     async function detectAllDrift() {
       // Quick health check — skip drift detection entirely if backend is down
       try {
-        const health = await fetch('/api/health', { signal: AbortSignal.timeout(3000) })
+        const health = await fetch('/api/health', { signal: AbortSignal.timeout(DRIFT_HEALTHCHECK_TIMEOUT_MS) })
         if (!health.ok) {
           setIsDetecting(false)
           return
@@ -132,7 +186,10 @@ export function GitOps() {
 
       setIsDetecting(true)
       const results = new Map<string, DriftResult>()
-      const configs = getGitOpsAppConfigs()
+      const configs = getGitOpsAppConfigs().map(c => {
+        const resolved = resolveAppCluster(c.cluster)
+        return { ...c, cluster: resolved.cluster, clusterAmbiguous: resolved.ambiguous }
+      })
 
       // Run drift checks in parallel with individual timeouts instead of
       // sequential requests, reducing total latency significantly.
@@ -147,9 +204,25 @@ export function GitOps() {
             path: appConfig.path,
             namespace: appConfig.namespace,
             cluster: appConfig.cluster || undefined })
-          return { name: appConfig.name, result: { drifted: response.data.drifted, resources: response.data.resources || [] } as DriftResult }
-        } catch {
-          return { name: appConfig.name, result: { drifted: false, resources: [], error: 'Failed to detect drift' } as DriftResult }
+          return {
+            name: appConfig.name,
+            result: {
+              status: 'ok' as const,
+              drifted: response.data.drifted,
+              resources: response.data.resources || [] } satisfies DriftResult }
+        } catch (e) {
+          // #6156 — Failed drift checks MUST NOT be coerced to
+          // `drifted: false` — that rendered as "synced + healthy" (false
+          // green). Return status: 'error' so the UI can render a distinct
+          // error state.
+          const message = e instanceof Error ? e.message : 'Failed to detect drift'
+          return {
+            name: appConfig.name,
+            result: {
+              status: 'error' as const,
+              drifted: false,
+              resources: [],
+              error: message } satisfies DriftResult }
         }
       })
 
@@ -164,9 +237,12 @@ export function GitOps() {
       setIsDetecting(false)
     }
 
+    detectAllDriftRef.current = detectAllDrift
     detectAllDrift()
     return () => { cancelled = true }
-  }, [])
+    // resolveAppCluster depends on `clusters`, which is the effective dep here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clusters])
 
   // Handle sync action - open the sync dialog
   const handleSync = (app: GitOpsApp) => {
@@ -180,35 +256,80 @@ export function GitOps() {
       setSyncedApps(prev => new Set(prev).add(syncDialogApp.name))
       setDriftResults(prev => {
         const updated = new Map(prev)
-        updated.set(syncDialogApp.name, { drifted: false, resources: [] })
+        updated.set(syncDialogApp.name, { status: 'ok', drifted: false, resources: [] })
+        return updated
+      })
+      // #6158 — record the real time the sync completed; this is the ONLY
+      // place a lastSyncTime should be captured.
+      setSyncedAt(prev => {
+        const updated = new Map(prev)
+        updated.set(syncDialogApp.name, new Date().toISOString())
         return updated
       })
       showToast(`${syncDialogApp.name} synced successfully!`, 'success')
     }
   }
 
+  // Track when the user manually triggered a sync from this session, so the
+  // "last sync" timestamp is a real event (a sync that actually happened via
+  // this UI) rather than a timestamp fabricated on every render. #6158
+  const [syncedAt, setSyncedAt] = useState<Map<string, string>>(new Map())
+
   // Build apps list with real drift status
   const apps = useMemo(() => {
-    const configs = getGitOpsAppConfigs()
+    // #5953 — Fill in a real cluster so the cluster filter below actually
+    // matches. Without this, `app.cluster` was always "" and every app was
+    // filtered out the moment a user selected a cluster.
+    // #6157 — resolveAppCluster now returns { cluster, ambiguous }.
+    const configs = getGitOpsAppConfigs().map(c => {
+      const resolved = resolveAppCluster(c.cluster)
+      return { ...c, cluster: resolved.cluster, clusterAmbiguous: resolved.ambiguous }
+    })
     return configs.map((config): GitOpsApp => {
+      // #6158 — lastSyncTime is ONLY set when the user actually synced via
+      // SyncDialog in this session. We never fabricate a timestamp on
+      // render. When unknown, the UI displays t('gitops.unknown').
+      const realSyncTime = syncedAt.get(config.name)
       if (syncedApps.has(config.name)) {
-        return { ...config, syncStatus: 'synced', healthStatus: 'healthy', lastSyncTime: new Date().toISOString(), driftDetails: undefined }
+        return { ...config, syncStatus: 'synced', healthStatus: 'healthy', lastSyncTime: realSyncTime, driftDetails: undefined }
       }
       if (isDetecting) {
         return { ...config, syncStatus: 'checking', healthStatus: 'progressing', lastSyncTime: undefined, driftDetails: undefined }
       }
       const drift = driftResults.get(config.name)
       if (drift) {
+        // #6156 — Render failed drift checks as a distinct error state.
+        if (drift.status === 'error') {
+          return {
+            ...config,
+            syncStatus: 'error',
+            healthStatus: 'unknown',
+            lastSyncTime: undefined,
+            driftDetails: drift.error ? [drift.error] : ['Failed to detect drift'] }
+        }
         const driftDetails = drift.resources.length > 0
           ? drift.resources.map(r => `${r.kind}/${r.name}: ${r.field || 'modified'}`)
-          : drift.error ? [drift.error] : undefined
-        return { ...config, syncStatus: drift.drifted ? 'out-of-sync' : 'synced', healthStatus: drift.drifted ? 'progressing' : 'healthy', lastSyncTime: new Date().toISOString(), driftDetails }
+          : undefined
+        return {
+          ...config,
+          syncStatus: drift.drifted ? 'out-of-sync' : 'synced',
+          healthStatus: drift.drifted ? 'progressing' : 'healthy',
+          // #6158 — do not fabricate a client-side timestamp here.
+          lastSyncTime: realSyncTime,
+          driftDetails }
       }
       return { ...config, syncStatus: 'unknown', healthStatus: 'missing', lastSyncTime: undefined, driftDetails: undefined }
     })
-  }, [driftResults, isDetecting, syncedApps])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [driftResults, isDetecting, syncedApps, syncedAt, clusters])
 
-  const filteredApps = apps.map(app => syncedApps.has(app.name) ? { ...app, syncStatus: 'synced' as const, healthStatus: 'healthy' as const, driftDetails: undefined, lastSyncTime: new Date().toISOString() } : app)
+  // #6158 — no longer regenerates lastSyncTime here. The synced overlay only
+  // normalizes status fields; timestamps flow through from `apps`, which
+  // reads the real sync time from the `syncedAt` map.
+  const filteredApps = apps
+      .map(app => syncedApps.has(app.name)
+        ? { ...app, syncStatus: 'synced' as const, healthStatus: 'healthy' as const, driftDetails: undefined }
+        : app)
       .filter(app => {
         if (selectedCluster && app.cluster !== selectedCluster) return false
         if (statusFilter === 'synced' && app.syncStatus !== 'synced') return false
@@ -233,6 +354,8 @@ export function GitOps() {
       case 'synced': return 'text-green-400 bg-green-500/20'
       case 'out-of-sync': return 'text-yellow-400 bg-yellow-500/20'
       case 'checking': return 'text-blue-400 bg-blue-500/20'
+      // #6156 — distinct visual for error (red), not green.
+      case 'error': return 'text-red-400 bg-red-500/20'
       default: return 'text-muted-foreground bg-card'
     }
   }
@@ -242,6 +365,8 @@ export function GitOps() {
       case 'synced': return t('gitops.synced')
       case 'out-of-sync': return t('gitops.outOfSync')
       case 'checking': return t('gitops.checking')
+      // #6156 — distinct label for the error state (not "unknown").
+      case 'error': return t('gitops.driftCheckFailed')
       default: return t('gitops.unknown')
     }
   }
@@ -250,6 +375,9 @@ export function GitOps() {
     switch (status) {
       case 'healthy': return 'healthy'
       case 'progressing': return 'warning'
+      // #6156 — drift-check errors render as warning (not healthy/error
+      // green), so the user knows the state is unknown, not confirmed good.
+      case 'unknown': return 'warning'
       default: return 'error'
     }
   }
@@ -352,6 +480,15 @@ export function GitOps() {
                         <span className="flex items-center gap-1" title={t('gitops.targetCluster')}>
                           <span className="text-muted-foreground/50">→</span>
                           <span>{app.cluster}</span>
+                        </span>
+                      )}
+                      {/* #6157 — multiple clusters exist and no explicit
+                          target was configured; show "cluster: unknown"
+                          instead of silently attributing to clusters[0]. */}
+                      {!app.cluster && app.clusterAmbiguous && (
+                        <span className="flex items-center gap-1 text-yellow-400" title={t('gitops.targetCluster')}>
+                          <span className="text-muted-foreground/50">→</span>
+                          <span>{t('gitops.clusterUnresolved')}</span>
                         </span>
                       )}
                     </div>

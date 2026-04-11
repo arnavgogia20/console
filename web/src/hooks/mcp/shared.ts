@@ -198,11 +198,12 @@ function mergeWithStoredClusters(newClusters: ClusterInfo[]): ClusterInfo[] {
   return newClusters.map(cluster => {
     const cached = storedMap.get(cluster.name)
     if (cached) {
-      // Helper: use new value only if it's a positive number, else use cached
+      // Helper: prefer new value when defined (including zero); only fall back
+      // to cached when the new value is truly missing (undefined).
+      // A legitimate zero (e.g. cluster scaled to 0 pods) must be respected.
       const pickMetric = (newVal: number | undefined, cachedVal: number | undefined) => {
-        if (newVal !== undefined && newVal > 0) return newVal
-        if (cachedVal !== undefined && cachedVal > 0) return cachedVal
-        return newVal // fallback to new value (could be 0 or undefined)
+        if (newVal !== undefined) return newVal
+        return cachedVal
       }
 
       // Merge: use new data but preserve cached metrics if new data is missing/zero
@@ -254,6 +255,33 @@ export const clusterSubscribers = new Set<ClusterSubscriber>()
 // Notify all subscribers of state change
 export function notifyClusterSubscribers() {
   clusterSubscribers.forEach(subscriber => subscriber(clusterCache))
+}
+
+/**
+ * Clear all cluster caches on logout so data from a previous user session
+ * does not leak to the next login (#5405). Clears both localStorage keys
+ * and the module-level in-memory cache, then notifies subscribers so the
+ * UI resets to a loading/empty state.
+ */
+export function clearClusterCacheOnLogout(): void {
+  try {
+    localStorage.removeItem(CLUSTER_CACHE_KEY)
+    localStorage.removeItem(CLUSTER_DIST_CACHE_KEY)
+  } catch {
+    // Ignore storage errors
+  }
+
+  clusterCache = {
+    clusters: [],
+    lastUpdated: null,
+    isLoading: true,
+    isRefreshing: false,
+    error: null,
+    consecutiveFailures: 0,
+    isFailed: false,
+    lastRefresh: null,
+  }
+  notifyClusterSubscribers()
 }
 
 // ============================================================================
@@ -507,7 +535,15 @@ export function deduplicateClustersByServer(clusters: ClusterInfo[]): ClusterInf
     const primary = sorted[0]
     const aliases = sorted.slice(1).map(c => c.name)
 
-    // Merge the best metrics from all duplicates
+    // Merge the best metrics from all duplicates.
+    //
+    // nodeCount and podCount are counts of live resources — NOT "max across all
+    // observations". Previously we took Math.max, which over-counted after a
+    // scale-down because the larger stale value from a previous sample kept
+    // winning (issue #6112). Instead, prefer the primary cluster's current
+    // values and only fall back to an alias value when the primary hasn't
+    // reported yet (nodeCount/podCount undefined). This gives us the freshest
+    // authoritative count without resurrecting stale numbers.
     let bestMetrics: Partial<ClusterInfo> = {}
     for (const cluster of (group || [])) {
       if (cluster.cpuCores && !bestMetrics.cpuCores) {
@@ -527,13 +563,23 @@ export function deduplicateClustersByServer(clusters: ClusterInfo[]): ClusterInf
           pvcBoundCount: cluster.pvcBoundCount,
         }
       }
-      // Take the best individual metrics
-      if ((cluster.nodeCount || 0) > (bestMetrics.nodeCount || 0)) {
-        bestMetrics.nodeCount = cluster.nodeCount
-      }
-      if ((cluster.podCount || 0) > (bestMetrics.podCount || 0)) {
-        bestMetrics.podCount = cluster.podCount
-      }
+    }
+    // Authoritative counts: use the primary cluster's values; only fall back to
+    // an alias when the primary has no value reported at all.
+    if (primary.nodeCount !== undefined) {
+      bestMetrics.nodeCount = primary.nodeCount
+    } else {
+      const alias = group.find(c => c !== primary && c.nodeCount !== undefined)
+      if (alias) bestMetrics.nodeCount = alias.nodeCount
+    }
+    if (primary.podCount !== undefined) {
+      bestMetrics.podCount = primary.podCount
+    } else {
+      const alias = group.find(c => c !== primary && c.podCount !== undefined)
+      if (alias) bestMetrics.podCount = alias.podCount
+    }
+    // Legacy merge loop preserved only for request metrics (below).
+    for (const cluster of (group || [])) {
       // Merge request metrics - these may come from a different cluster than capacity
       if (cluster.cpuRequestsCores && !bestMetrics.cpuRequestsCores) {
         bestMetrics.cpuRequestsMillicores = cluster.cpuRequestsMillicores
@@ -581,24 +627,11 @@ export function updateSingleClusterInCache(clusterName: string, updates: Partial
         return
       }
 
-      // For numeric metrics, preserve positive cached values when new value is 0
-      const metricsKeys = ['cpuCores', 'memoryBytes', 'memoryGB', 'storageBytes', 'storageGB', 'cpuRequestsMillicores', 'cpuRequestsCores', 'memoryRequestsBytes', 'memoryRequestsGB', 'cpuUsageMillicores', 'cpuUsageCores', 'memoryUsageBytes', 'memoryUsageGB']
-      if (metricsKeys.includes(key) && typeof value === 'number' && value === 0) {
-        // Keep existing positive value if available
-        const existingValue = c[key as keyof ClusterInfo]
-        if (typeof existingValue === 'number' && existingValue > 0) {
-          return // Skip, keep existing positive value
-        }
-      }
-
-      // Don't set reachable to false if we have valid cached node data
-      // This prevents transient health check failures from immediately marking clusters as offline
-      if (key === 'reachable' && value === false) {
-        const hasValidCachedData = typeof c.nodeCount === 'number' && c.nodeCount > 0
-        if (hasValidCachedData) {
-          return // Skip, keep cluster reachable since we have valid data
-        }
-      }
+      // For numeric metrics, only fall back to cached when new value is undefined.
+      // A real zero (e.g. scaled-to-zero) must be respected — see #5443.
+      // NOTE: reachability (key === 'reachable') is no longer blocked by cached
+      // node data — the useMCP hook already gates reachable=false behind 5 minutes
+      // of consecutive failures, so the value is authoritative — see #5444.
 
       // Apply the update
       (merged as Record<string, unknown>)[key] = value
@@ -698,6 +731,12 @@ export function connectSharedWebSocket() {
     const ws = new WebSocket(wsUrl)
 
     ws.onopen = () => {
+      // Guard against race condition where onclose fires before onopen
+      // (observed in Safari and during rapid reconnection cycles).
+      // ws.readyState may no longer be OPEN by the time this handler runs.
+      if (ws.readyState !== WebSocket.OPEN) {
+        return
+      }
       // Send authentication message - backend requires this within 5 seconds
       const token = localStorage.getItem(STORAGE_KEY_TOKEN)
       if (token) {
@@ -1285,23 +1324,26 @@ export async function fullFetchClusters() {
     return
   }
 
-  // DEMO MODE: When user has explicitly enabled demo mode, use demo data immediately.
-  // Don't try to fetch from agent - user wants to see demo data, not live data.
-  // This respects the user's explicit choice to enable demo mode.
-  if (isDemoMode()) {
-    updateClusterCache({
-      clusters: getDemoClusters(),
-      isLoading: false,
-      isRefreshing: false,
-      error: null,
-      lastUpdated: new Date(),
-      consecutiveFailures: 0,
-      isFailed: false,
-      lastRefresh: new Date(),
-    })
-    return
-  }
-
+  // Historical note: this function used to short-circuit to getDemoClusters()
+  // whenever isDemoMode() returned true. That broke in-cluster deployments in
+  // two ways:
+  //   1) PR #6215 gated the short-circuit on `!isInClusterMode() || !hasRealToken()`,
+  //      but hasRealToken() is false for any session running under a demo token,
+  //      so Create Namespace still listed demo clusters when demo mode was
+  //      toggled on (which is the exact bug report).
+  //   2) PR #6233 relaxed it to `!isInClusterMode()` only, but that still fires
+  //      on the FIRST call at page load because `isInClusterMode()` reads from
+  //      backendHealthManager, whose initial state is `{status: 'connecting',
+  //      inCluster: false}` — the real value is only known after /health
+  //      responds. The early return therefore races the health check and
+  //      persists demo clusters into the shared cache.
+  //
+  // Fix: drop the early-return entirely. The downstream fallback at
+  // `isDemoMode() && isDemoToken()` (after fetchClusterListFromAgent fails)
+  // already handles the "demo mode with demo token" case correctly, and real
+  // backends will happily return live clusters even when the demo-mode toggle
+  // is set. Netlify-forced demo mode is handled by the isNetlifyDeployment
+  // block below, so forced-demo deploys still skip the live fetch entirely.
   // On forced demo mode deployments (Netlify), skip fetching entirely to avoid flicker.
   // Demo data is already in the initial cache state, so no loading indicators needed.
   if (isNetlifyDeployment) {

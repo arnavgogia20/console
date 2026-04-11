@@ -8,6 +8,9 @@ import { useKagentBackend } from '../../hooks/useKagentBackend'
 import { useProviderConnection } from '../../hooks/useProviderConnection'
 import { AgentIcon } from './AgentIcon'
 import type { AgentInfo, AgentProvider } from '../../types/agent'
+
+/** Timeout (ms) for fetching mission install guide files from the API */
+const MISSION_FILE_FETCH_TIMEOUT_MS = 5_000
 import { PROVIDER_PREREQUISITES } from '../../types/agent'
 import type { MissionExport } from '../../lib/missions/types'
 import { cn } from '../../lib/cn'
@@ -96,7 +99,7 @@ export function AgentSelector({ compact = false, className = '' }: AgentSelector
     const paths = INSTALL_MISSION_PATHS[missionId] || [`fixes/cncf-install/${missionId}.json`, `fixes/platform-install/${missionId}.json`]
     for (const path of paths) {
       try {
-        const res = await fetch(`/api/missions/file?path=${encodeURIComponent(path)}`, { signal: AbortSignal.timeout(5000) })
+        const res = await fetch(`/api/missions/file?path=${encodeURIComponent(path)}`, { signal: AbortSignal.timeout(MISSION_FILE_FETCH_TIMEOUT_MS) })
         if (!res.ok) continue
         const raw = await res.text()
         const parsed = JSON.parse(raw)
@@ -128,7 +131,7 @@ export function AgentSelector({ compact = false, className = '' }: AgentSelector
     let missionData: MissionExport | null = null
     for (const path of paths) {
       try {
-        const res = await fetch(`/api/missions/file?path=${encodeURIComponent(path)}`, { signal: AbortSignal.timeout(5000) })
+        const res = await fetch(`/api/missions/file?path=${encodeURIComponent(path)}`, { signal: AbortSignal.timeout(MISSION_FILE_FETCH_TIMEOUT_MS) })
         if (!res.ok) continue
         const raw = await res.text()
         const parsed = JSON.parse(raw)
@@ -399,7 +402,7 @@ export function AgentSelector({ compact = false, className = '' }: AgentSelector
           ref={panelRef}
           role="listbox"
           aria-label={t('agent.selectAgent')}
-          className="fixed z-[9999] w-96 max-h-[calc(100vh-8rem)] rounded-lg bg-card border border-border shadow-lg overflow-hidden flex flex-col"
+          className="fixed z-dropdown w-96 max-h-[calc(100vh-8rem)] rounded-lg bg-card border border-border shadow-lg overflow-hidden flex flex-col"
           style={{ top: dropdownPos.top, right: dropdownPos.right }}
           onKeyDown={(e) => {
             if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return
@@ -431,6 +434,9 @@ export function AgentSelector({ compact = false, className = '' }: AgentSelector
                     const prev = previousAgentRef.current
                     const restored = prev ? sortedAgents.find(a => a.name === prev && a.available) : undefined
                     const targetAgent = restored?.name || sortedAgents.find(a => a.available)?.name || ''
+
+                    // Guard: don't select an empty agent ID (#5673)
+                    if (!targetAgent) return
 
                     if (!hasApprovedAgents()) {
                       // Show approval dialog before enabling
@@ -606,8 +612,15 @@ export function AgentSelector({ compact = false, className = '' }: AgentSelector
         const target = pendingAgentRef.current
         pendingAgentRef.current = null
         if (target) {
-          selectAgent(target)
-          closeDropdown()
+          // Run the same readiness lifecycle as handleSelect (#5677)
+          const providerKey = AGENT_TO_PROVIDER_KEY[target]
+          if (providerKey && PROVIDER_PREREQUISITES[providerKey]) {
+            selectAgent(target)
+            startConnection(target, () => closeDropdown())
+          } else {
+            selectAgent(target)
+            closeDropdown()
+          }
         }
       }}
       onCancel={() => {
@@ -618,7 +631,7 @@ export function AgentSelector({ compact = false, className = '' }: AgentSelector
     {/* Install guide modal */}
     {(installGuide || installGuideLoading || installGuideError) && createPortal(
       <div
-        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-2xl"
+        className="fixed inset-0 z-modal flex items-center justify-center bg-black/60 backdrop-blur-sm"
         onClick={(e) => { if (e.target === e.currentTarget) { setInstallGuide(null); setInstallGuideLoading(false); setInstallGuideError(false) } }}
         onKeyDown={(e) => { if (e.key === 'Escape') { setInstallGuide(null); setInstallGuideLoading(false); setInstallGuideError(false) } }}
         tabIndex={-1}

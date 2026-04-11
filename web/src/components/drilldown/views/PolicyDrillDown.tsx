@@ -183,7 +183,11 @@ export function PolicyDrillDown({ data }: Props) {
                   kind: result.resources?.[0]?.kind || 'Unknown',
                   namespace: result.resources?.[0]?.namespace,
                   message: result.message || 'Policy violation',
-                  timestamp: result.timestamp,
+                  timestamp: typeof result.timestamp === 'string'
+                    ? result.timestamp
+                    : result.timestamp && typeof result.timestamp === 'object' && 'seconds' in result.timestamp
+                      ? (() => { const d = new Date(Number(result.timestamp.seconds) * 1000); return isNaN(d.getTime()) ? undefined : d.toISOString() })()
+                      : undefined,
                 })
               }
             }

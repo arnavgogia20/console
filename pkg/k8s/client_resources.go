@@ -260,9 +260,10 @@ func (m *MultiClusterClient) GetEvents(ctx context.Context, contextName, namespa
 		return nil, err
 	}
 
-	// Sort by last timestamp descending
+	// Sort by effective event time descending (prefers modern EventTime,
+	// falls back to LastTimestamp for older clusters). See issue #6042.
 	sort.Slice(events.Items, func(i, j int) bool {
-		return events.Items[i].LastTimestamp.After(events.Items[j].LastTimestamp.Time)
+		return EffectiveEventTime(&events.Items[i]).After(EffectiveEventTime(&events.Items[j]))
 	})
 
 	var result []Event
@@ -270,6 +271,8 @@ func (m *MultiClusterClient) GetEvents(ctx context.Context, contextName, namespa
 		if limit > 0 && i >= limit {
 			break
 		}
+		evt := event
+		lastSeen := EffectiveEventTime(&evt)
 		e := Event{
 			Type:      event.Type,
 			Reason:    event.Reason,
@@ -278,13 +281,13 @@ func (m *MultiClusterClient) GetEvents(ctx context.Context, contextName, namespa
 			Namespace: event.Namespace,
 			Cluster:   contextName,
 			Count:     event.Count,
-			Age:       formatDuration(time.Since(event.LastTimestamp.Time)),
+		}
+		if !lastSeen.IsZero() {
+			e.Age = formatDuration(time.Since(lastSeen))
+			e.LastSeen = lastSeen.Format(time.RFC3339)
 		}
 		if !event.FirstTimestamp.IsZero() {
 			e.FirstSeen = event.FirstTimestamp.Time.Format(time.RFC3339)
-		}
-		if !event.LastTimestamp.IsZero() {
-			e.LastSeen = event.LastTimestamp.Time.Format(time.RFC3339)
 		}
 		result = append(result, e)
 	}
@@ -306,9 +309,10 @@ func (m *MultiClusterClient) GetWarningEvents(ctx context.Context, contextName, 
 		return nil, err
 	}
 
-	// Sort by last timestamp descending
+	// Sort by effective event time descending (prefers modern EventTime,
+	// falls back to LastTimestamp for older clusters). See issue #6042.
 	sort.Slice(events.Items, func(i, j int) bool {
-		return events.Items[i].LastTimestamp.After(events.Items[j].LastTimestamp.Time)
+		return EffectiveEventTime(&events.Items[i]).After(EffectiveEventTime(&events.Items[j]))
 	})
 
 	var result []Event
@@ -316,6 +320,8 @@ func (m *MultiClusterClient) GetWarningEvents(ctx context.Context, contextName, 
 		if limit > 0 && i >= limit {
 			break
 		}
+		evt := event
+		lastSeen := EffectiveEventTime(&evt)
 		e := Event{
 			Type:      event.Type,
 			Reason:    event.Reason,
@@ -324,13 +330,13 @@ func (m *MultiClusterClient) GetWarningEvents(ctx context.Context, contextName, 
 			Namespace: event.Namespace,
 			Cluster:   contextName,
 			Count:     event.Count,
-			Age:       formatDuration(time.Since(event.LastTimestamp.Time)),
+		}
+		if !lastSeen.IsZero() {
+			e.Age = formatDuration(time.Since(lastSeen))
+			e.LastSeen = lastSeen.Format(time.RFC3339)
 		}
 		if !event.FirstTimestamp.IsZero() {
 			e.FirstSeen = event.FirstTimestamp.Time.Format(time.RFC3339)
-		}
-		if !event.LastTimestamp.IsZero() {
-			e.LastSeen = event.LastTimestamp.Time.Format(time.RFC3339)
 		}
 		result = append(result, e)
 	}
@@ -708,20 +714,51 @@ func (m *MultiClusterClient) GetServices(ctx context.Context, contextName, names
 		return nil, err
 	}
 
+	// Fetch the corresponding core/v1 Endpoints objects so we can report the
+	// real number of ready addresses backing each service. We list in the
+	// same namespace scope as the Services list call so the result set is
+	// comparable. If this call fails we still return services with
+	// Endpoints=0 rather than failing the whole request (issue #6150).
+	endpointReadyCounts := make(map[string]int) // key: "<namespace>/<name>"
+	if epList, epErr := client.CoreV1().Endpoints(namespace).List(ctx, metav1.ListOptions{}); epErr == nil {
+		for _, ep := range epList.Items {
+			ready := 0
+			for _, subset := range ep.Subsets {
+				ready += len(subset.Addresses)
+			}
+			endpointReadyCounts[ep.Namespace+"/"+ep.Name] = ready
+		}
+	}
+
 	var result []Service
 	for _, svc := range services.Items {
-		// Build ports list
+		// Build ports list. We populate both the legacy flat []string
+		// form (existing consumers) and the structured PortDetails form
+		// which preserves the port Name (issue #6163).
 		var ports []string
+		var portDetails []ServicePortDetail
 		for _, p := range svc.Spec.Ports {
 			portStr := fmt.Sprintf("%d/%s", p.Port, p.Protocol)
 			if p.NodePort != 0 {
 				portStr = fmt.Sprintf("%d:%d/%s", p.Port, p.NodePort, p.Protocol)
 			}
 			ports = append(ports, portStr)
+			portDetails = append(portDetails, ServicePortDetail{
+				Name:     p.Name,
+				Port:     p.Port,
+				Protocol: string(p.Protocol),
+				NodePort: p.NodePort,
+			})
 		}
 
-		// Get external IP
+		// Resolve external IP and LoadBalancer provisioning status.
+		// For LoadBalancer services, if status.loadBalancer.ingress is
+		// empty we mark the service as Provisioning and leave ExternalIP
+		// blank (issue #6153). status.loadBalancer.ingress.ip takes
+		// precedence over hostname, and spec.externalIPs (statically
+		// assigned) overrides both.
 		externalIP := ""
+		lbStatus := ""
 		if len(svc.Status.LoadBalancer.Ingress) > 0 {
 			if svc.Status.LoadBalancer.Ingress[0].IP != "" {
 				externalIP = svc.Status.LoadBalancer.Ingress[0].IP
@@ -731,6 +768,13 @@ func (m *MultiClusterClient) GetServices(ctx context.Context, contextName, names
 		}
 		if len(svc.Spec.ExternalIPs) > 0 {
 			externalIP = svc.Spec.ExternalIPs[0]
+		}
+		if svc.Spec.Type == corev1.ServiceTypeLoadBalancer {
+			if externalIP == "" {
+				lbStatus = LBStatusProvisioning
+			} else {
+				lbStatus = LBStatusReady
+			}
 		}
 
 		// Calculate age
@@ -744,6 +788,10 @@ func (m *MultiClusterClient) GetServices(ctx context.Context, contextName, names
 			ClusterIP:   svc.Spec.ClusterIP,
 			ExternalIP:  externalIP,
 			Ports:       ports,
+			PortDetails: portDetails,
+			Endpoints:   endpointReadyCounts[svc.Namespace+"/"+svc.Name],
+			LBStatus:    lbStatus,
+			Selector:    svc.Spec.Selector,
 			Age:         age,
 			Labels:      svc.Labels,
 			Annotations: svc.Annotations,

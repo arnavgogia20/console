@@ -253,3 +253,48 @@ export const TOOLTIP_HIDE_DELAY_MS = 50
 
 /** Maximum number of characters allowed in a single mission chat message */
 export const MAX_MESSAGE_SIZE_CHARS = 10_000
+
+// ============================================================================
+// Service / LoadBalancer labels
+// ============================================================================
+
+/** Display label for a LoadBalancer service whose cloud provider has not yet
+ * assigned an external IP or hostname. Issue #6153 — previously the UI
+ * showed a blank / dash value which was indistinguishable from a provisioned
+ * service with no ingress. */
+export const LB_PROVISIONING_LABEL = 'Provisioning'
+
+/** Wire value returned by the backend for a LoadBalancer service that is
+ * still being provisioned (matches k8s.LBStatusProvisioning in Go). */
+export const LB_STATUS_PROVISIONING = 'Provisioning'
+
+/** Wire value returned by the backend for a LoadBalancer service that has
+ * an ingress IP/hostname assigned (matches k8s.LBStatusReady in Go). */
+export const LB_STATUS_READY = 'Ready'
+
+// ============================================================================
+// Services cache freshness (issue #6162)
+// ============================================================================
+
+/** Maximum age of a cached services payload before it must be discarded
+ * and refetched. The underlying cache layer refreshes on a shorter
+ * interval but this is the hard wall after which stale data is ignored
+ * on read. */
+export const SERVICES_CACHE_TTL_MS = 60_000
+
+/** Age threshold above which the services UI marks its data as stale
+ * (shown as a "Cached • Ns ago" / "Stale" badge). Strictly less than
+ * SERVICES_CACHE_TTL_MS. */
+export const SERVICES_CACHE_STALE_MS = 30_000
+
+/** Conversion factor from milliseconds to seconds, used when formatting
+ * the "Cached • Ns ago" label. */
+export const MS_PER_SECOND = 1_000
+
+// ============================================================================
+// Service port rendering (issue #6163)
+// ============================================================================
+
+/** Separator inserted between a port name and its port/protocol string
+ * when rendering a named port (e.g. `http: 80/TCP`). */
+export const PORT_NAME_SEPARATOR = ': '

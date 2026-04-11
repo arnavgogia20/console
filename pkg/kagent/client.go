@@ -8,6 +8,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"bytes"
 	"strings"
 	"time"
 )
@@ -86,8 +87,7 @@ func (c *KagentClient) ListAgents() ([]AgentInfo, error) {
 
 	var agents []AgentInfo
 	if err := json.NewDecoder(resp.Body).Decode(&agents); err != nil {
-		// The controller may return a wrapper object — try unwrapping
-		return []AgentInfo{}, nil
+		return nil, fmt.Errorf("failed to decode agent list: %w", err)
 	}
 	return agents, nil
 }
@@ -152,7 +152,7 @@ func (c *KagentClient) Invoke(ctx context.Context, namespace, agentName, message
 
 	url := fmt.Sprintf("%s/api/a2a/%s/%s",
 		c.baseURL, neturl.PathEscape(namespace), neturl.PathEscape(agentName))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(payload)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -200,10 +200,21 @@ func buildDetectCandidates() []string {
 
 // Detect tries common in-cluster kagent service URLs and returns the first
 // reachable one. Returns an empty string if none are reachable.
+// Uses a background context; prefer DetectWithContext for cancellation support.
 func (c *KagentClient) Detect() string {
+	return c.DetectWithContext(context.Background())
+}
+
+// DetectWithContext tries common in-cluster kagent service URLs with context
+// support for cancellation and timeouts (#5566).
+func (c *KagentClient) DetectWithContext(ctx context.Context) string {
 	candidates := buildDetectCandidates()
 	for _, url := range candidates {
-		resp, err := c.httpClient.Get(url + "/health")
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url+"/health", nil)
+		if err != nil {
+			continue
+		}
+		resp, err := c.httpClient.Do(req)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode < 400 {

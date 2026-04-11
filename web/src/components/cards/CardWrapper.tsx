@@ -26,6 +26,7 @@ import { useLocalAgent } from '../../hooks/useLocalAgent'
 import { CARD_INSTALL_MAP } from '../../lib/cards/cardInstallMap'
 import { loadMissionPrompt } from '../cards/multi-tenancy/missionLoader'
 import { ClusterSelectionDialog } from '../missions/ClusterSelectionDialog'
+import { ConfirmMissionPromptDialog } from '../missions/ConfirmMissionPromptDialog'
 // Lazy-load the widget export modal (~42 KB + code generator ~30 KB) — only when user exports
 const WidgetExportModal = lazy(() =>
   import('../widgets/WidgetExportModal').then(m => ({ default: m.WidgetExportModal }))
@@ -41,6 +42,40 @@ import { copyToClipboard } from '../../lib/clipboard'
 
 // Minimum duration to show spin animation (ensures at least one full rotation)
 const MIN_SPIN_DURATION = 500
+
+// #6227: shared Escape-key coordinator. Multiple InfoTooltips (one per
+// CardWrapper) used to each register their own document-level keydown
+// listener; pressing Escape would fire ALL of them and close every open
+// tooltip on the dashboard at once. Now each tooltip pushes its close
+// callback onto a shared LIFO stack and only the topmost (most recently
+// opened) callback runs. A single document listener is registered on the
+// first push and removed on the last pop.
+const escapeStack: Array<() => void> = []
+let escapeListenerAttached = false
+function handleGlobalEscape(e: KeyboardEvent) {
+  if (e.key !== 'Escape' || escapeStack.length === 0) return
+  const top = escapeStack[escapeStack.length - 1]
+  // stopImmediatePropagation prevents any other peer keydown listeners
+  // (e.g. DrillDownModal) from firing on the same event when an
+  // InfoTooltip is the topmost element.
+  e.stopImmediatePropagation()
+  top()
+}
+function pushEscapeHandler(close: () => void): () => void {
+  escapeStack.push(close)
+  if (!escapeListenerAttached) {
+    document.addEventListener('keydown', handleGlobalEscape, true)
+    escapeListenerAttached = true
+  }
+  return () => {
+    const idx = escapeStack.lastIndexOf(close)
+    if (idx >= 0) escapeStack.splice(idx, 1)
+    if (escapeStack.length === 0 && escapeListenerAttached) {
+      document.removeEventListener('keydown', handleGlobalEscape, true)
+      escapeListenerAttached = false
+    }
+  }
+}
 
 /** One hour in milliseconds — default snooze duration for card swaps */
 const ONE_HOUR_MS = 60 * 60 * 1000
@@ -273,6 +308,8 @@ function InfoTooltip({ text }: { text: string }) {
   }, [isVisible, updatePosition])
 
   // Close tooltip when clicking outside or pressing Escape
+  // #6227: Escape is routed through the shared escapeStack so only the
+  // topmost open tooltip closes — used to fire on every mounted tooltip.
   useEffect(() => {
     if (!isVisible) return
 
@@ -283,17 +320,11 @@ function InfoTooltip({ text }: { text: string }) {
       }
     }
 
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setIsVisible(false)
-      }
-    }
-
     document.addEventListener('mousedown', handleClickOutside)
-    document.addEventListener('keydown', handleKeyDown)
+    const popEscape = pushEscapeHandler(() => setIsVisible(false))
     return () => {
       document.removeEventListener('mousedown', handleClickOutside)
-      document.removeEventListener('keydown', handleKeyDown)
+      popEscape()
     }
   }, [isVisible])
 
@@ -317,7 +348,7 @@ function InfoTooltip({ text }: { text: string }) {
           ref={tooltipRef}
           id={tooltipId}
           role="tooltip"
-          className="fixed z-[100] max-w-xs px-3 py-2.5 text-xs leading-relaxed rounded-lg bg-background border border-border text-foreground shadow-xl animate-fade-in"
+          className="fixed z-dropdown max-w-xs px-3 py-2.5 text-xs leading-relaxed rounded-lg bg-background border border-border text-foreground shadow-xl animate-fade-in"
           style={{ top: position.top, left: position.left }}
           onMouseEnter={() => setIsVisible(true)}
           onMouseLeave={() => setIsVisible(false)}
@@ -392,6 +423,15 @@ export function CardWrapper({
   const [showBugReport, setShowBugReport] = useState(false)
   const [showInstallClusterSelect, setShowInstallClusterSelect] = useState(false)
   const [showInstallGuide, setShowInstallGuide] = useState<{ mission: { mission?: { title?: string; description?: string; steps?: { title?: string; description?: string }[] } } } | null>(null)
+  /**
+   * State for the install-via-AI prompt confirmation dialog (#5913).
+   * After the user picks clusters, we load the prompt and stash it here so
+   * the user can review/edit it before the mission actually starts.
+   */
+  const [pendingInstallMission, setPendingInstallMission] = useState<{
+    prompt: string
+    clusters: string[]
+  } | null>(null)
   const installInfo = CARD_INSTALL_MAP[cardType]
 
   // Register expand trigger for keyboard navigation
@@ -842,10 +882,19 @@ export function CardWrapper({
   void title
   void setLocalMessages
 
+  // #6149 — Memoize inline provider values so every CardWrapper re-render
+  // (there are dozens on every dashboard) does not invalidate the
+  // CardExpandedContext / ForceLiveContext consumers inside the card.
+  const cardExpandedValue = useMemo(
+    () => ({ isExpanded, containerSize }),
+    [isExpanded, containerSize]
+  )
+  const forceLiveValue = useMemo(() => !!forceLive, [forceLive])
+
   return (
     <CardTypeContext.Provider value={cardType}>
-    <CardExpandedContext.Provider value={{ isExpanded, containerSize }}>
-      <ForceLiveContext.Provider value={!!forceLive}>
+    <CardExpandedContext.Provider value={cardExpandedValue}>
+      <ForceLiveContext.Provider value={forceLiveValue}>
       <CardDataReportContext.Provider value={reportCtx}>
         <>
           {/* Outer wrapper for demo corner brackets (outside card border) */}
@@ -1400,15 +1449,37 @@ export function CardWrapper({
                 const clusterContext = clusters.length > 0
                   ? `\n\n**Target cluster(s):** ${clusters.join(', ')}\n\nPlease install on ${clusters.length === 1 ? `cluster "${clusters[0]}"` : `the following clusters: ${clusters.join(', ')}`}.`
                   : ''
+                // #5913 — Do not start the mission yet. Stash the prompt and
+                // let the user review/edit it via ConfirmMissionPromptDialog.
+                setPendingInstallMission({
+                  prompt: prompt + clusterContext,
+                  clusters,
+                })
+              }}
+              missionTitle={`Install ${installInfo.project}`}
+            />
+          )}
+
+          {/* Install CTA: confirm and edit the AI mission prompt before running (#5913) */}
+          {pendingInstallMission && installInfo && (
+            <ConfirmMissionPromptDialog
+              open={!!pendingInstallMission}
+              missionTitle={`Install ${installInfo.project}`}
+              missionDescription={`Install and configure ${installInfo.project}`}
+              initialPrompt={pendingInstallMission.prompt}
+              onCancel={() => setPendingInstallMission(null)}
+              onConfirm={(editedPrompt) => {
+                const { clusters } = pendingInstallMission
+                setPendingInstallMission(null)
                 startMission({
                   title: `Install ${installInfo.project}`,
                   description: `Install and configure ${installInfo.project}`,
                   type: 'deploy',
                   cluster: clusters.length > 0 ? clusters.join(',') : undefined,
-                  initialPrompt: prompt + clusterContext })
+                  initialPrompt: editedPrompt,
+                })
                 openSidebar()
               }}
-              missionTitle={`Install ${installInfo.project}`}
             />
           )}
 

@@ -540,6 +540,12 @@
       "almostDone": "Almost done — hang tight...",
       "updateComplete": "Update complete — restart successful",
       "updateFailed": "Update failed",
+      "cancelUpdate": "Cancel update",
+      "cancelling": "Cancelling...",
+      "cancelHint": "Cancels at the next step boundary — best-effort",
+      "cancelUnavailable": "Too late to cancel — restart already in progress",
+      "cancelFailed": "Failed to cancel update",
+      "cancelledHint": "Any partial changes have been rolled back. You can retry from the Update Now button.",
       "devMode": "Dev Mode",
       "binaryMode": "Binary",
       "helmMode": "Helm",
@@ -1506,7 +1512,7 @@
     "securityNote": "API keys are stored securely on your local machine and never sent to our servers.",
     "selectAgent": "Select AI agent",
     "installViaHomebrewMacOS": "# Install via Homebrew (macOS / WSL)",
-    "installLinuxBuildFromSource": "# Linux / WSL: build from source (requires Go 1.24+)"
+    "installLinuxBuildFromSource": "# Linux / WSL: build from source (requires Go 1.25+)"
   },
   "navbar": {
     "closeMenu": "Close menu",
@@ -2585,7 +2591,17 @@
     "connectAdding": "Adding...",
     "connectSuccess": "Cluster added successfully",
     "connectNext": "Next",
-    "connectBack": "Back"
+    "connectBack": "Back",
+    "removeCluster": "Remove cluster from kubeconfig",
+    "removeClusterTitle": "Remove Offline Cluster",
+    "removeClusterWarning": "This will permanently delete the cluster's context from your kubeconfig. The cluster itself will not be affected.",
+    "removeClusterContext": "Kubeconfig context to remove:",
+    "removeClusterDesc": "This updates your kubeconfig via the local agent. Only unreachable (offline) clusters can be removed from the cluster list.",
+    "removeClusterConfirm": "Remove cluster",
+    "removeClusterRemoving": "Removing...",
+    "removeClusterSuccess": "Removed cluster \"{{name}}\" from kubeconfig",
+    "removeClusterError": "Failed to remove cluster from kubeconfig",
+    "removeClusterNoAgent": "Local agent not connected"
   },
   "remediation": {
     "title": "AI Remediation Console",
@@ -2789,7 +2805,7 @@
     "remindMeLater": "Remind Me Later",
     "quickInstallMacOS": "Quick Install — macOS / WSL (Homebrew)",
     "linuxInstructions": "Linux / WSL installation instructions",
-    "linuxBuildDesc": "Build from source (recommended for Linux / WSL). Requires Go 1.24+:",
+    "linuxBuildDesc": "Build from source (recommended for Linux / WSL). Requires Go 1.25+:",
     "linuxBrewAlternative": "Alternatively, use Linuxbrew (Linux / WSL): brew tap kubestellar/tap && brew install kc-agent"
   },
   "agentStatus": {

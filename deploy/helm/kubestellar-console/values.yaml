@@ -3,7 +3,7 @@ replicaCount: 1
 image:
   repository: ghcr.io/kubestellar/console
   pullPolicy: IfNotPresent
-  tag: ""  # Defaults to chart appVersion
+  tag: ""  # Defaults to chart appVersion ("latest"); overridden at release time
 
 imagePullSecrets: []
 nameOverride: ""
@@ -20,18 +20,43 @@ serviceAccount:
 # its ServiceAccount for read-only cluster access + ResourceQuota CRUD.
 # Set resourceQuotasReadOnly to true to restrict ResourceQuota permissions
 # to read-only (disables GPU reservation enforcement).
+# Set namespaceCreationEnabled to true to grant the SA cluster-scoped
+# "create namespaces" — required when the GPU reservation form's
+# "New namespace..." option is used (otherwise that call 500s with
+# "namespaces is forbidden ... cannot create resource namespaces").
 rbac:
   create: true
   resourceQuotasReadOnly: false
+  namespaceCreationEnabled: false
 
 podAnnotations: {}
 podLabels: {}
 
-podSecurityContext: {}
+podSecurityContext:
+  # #6334: PodSecurity "restricted" enforcement (used on pok-prod and
+  # vllm-d) requires a non-empty seccompProfile at pod or container
+  # level. Setting it here covers all containers in one place.
+  seccompProfile:
+    type: RuntimeDefault
 
 securityContext:
+  # #6323/#6324: must be a numeric UID (not `appuser`) so the kubelet
+  # can verify non-root without reading the image manifest. Matches
+  # the Dockerfile's `addgroup -g 1001 … adduser -u 1001 … appuser`
+  # + `USER appuser`. Without an explicit numeric runAsUser,
+  # Kubernetes blocks startup on Kind/Minikube/OpenShift with:
+  #   CreateContainerConfigError: container has runAsNonRoot
+  #   and image has non-numeric user (appuser)
+  runAsUser: 1001
+  runAsGroup: 1001
   runAsNonRoot: true
   readOnlyRootFilesystem: true
+  # #6334: PodSecurity "restricted" also requires
+  # allowPrivilegeEscalation=false on every container; without this,
+  # the deploy job on pok-prod and vllm-d rolled back with
+  # "violates PodSecurity restricted:latest: allowPrivilegeEscalation
+  # != false".
+  allowPrivilegeEscalation: false
   capabilities:
     drop:
       - ALL

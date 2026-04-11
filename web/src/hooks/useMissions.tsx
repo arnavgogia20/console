@@ -3,7 +3,7 @@ import type { AgentInfo, AgentsListPayload, AgentSelectedPayload, ChatStreamPayl
 import { AgentCapabilityToolExec } from '../types/agent'
 import { getDemoMode } from './useDemoMode'
 import { DEMO_MISSIONS } from '../mocks/demoMissions'
-import { addCategoryTokens, setActiveTokenCategory } from './useTokenUsage'
+import { addCategoryTokens, setActiveTokenCategory, clearActiveTokenCategory } from './useTokenUsage'
 import { detectIssueSignature, findSimilarResolutionsStandalone, generateResolutionPromptContext } from './useResolutions'
 import { LOCAL_AGENT_WS_URL, LOCAL_AGENT_HTTP_URL } from '../lib/constants'
 import { emitMissionStarted, emitMissionCompleted, emitMissionError, emitMissionRated } from '../lib/analytics'
@@ -11,7 +11,29 @@ import { scanForMaliciousContent } from '../lib/missions/scanner/malicious'
 import { runPreflightCheck, type PreflightError } from '../lib/missions/preflightCheck'
 import { kubectlProxy } from '../lib/kubectlProxy'
 
-export type MissionStatus = 'pending' | 'running' | 'waiting_input' | 'completed' | 'failed' | 'saved' | 'blocked' | 'cancelling'
+export type MissionStatus = 'pending' | 'running' | 'waiting_input' | 'completed' | 'failed' | 'saved' | 'blocked' | 'cancelling' | 'cancelled'
+
+/**
+ * Mission statuses that are NOT considered "active" in the sidebar list,
+ * the active counter, or the toggle button badge (#5946, #5947).
+ *
+ * - `saved`  : library entries the user hasn't run yet
+ * - `completed` / `failed` / `cancelled` : terminal states — the mission is done
+ *
+ * Everything else (`pending`, `running`, `waiting_input`, `blocked`, `cancelling`)
+ * is treated as active because the user may still need to take action on it.
+ */
+export const INACTIVE_MISSION_STATUSES: ReadonlySet<MissionStatus> = new Set([
+  'saved',
+  'completed',
+  'failed',
+  'cancelled',
+])
+
+/** True if the mission is currently active (i.e. not saved/terminal). */
+export function isActiveMission(mission: Pick<Mission, 'status'>): boolean {
+  return !INACTIVE_MISSION_STATUSES.has(mission.status)
+}
 
 export interface MissionMessage {
   id: string
@@ -152,6 +174,18 @@ const SELECTED_AGENT_KEY = 'kc_selected_agent'
 
 /** Delay before auto-reconnecting interrupted missions after WS opens */
 const MISSION_RECONNECT_DELAY_MS = 500
+/**
+ * Maximum age (ms) a disconnected mission may have before auto-resume is
+ * considered unsafe (#6371). Agents purge sessions after a short idle
+ * window, so resuming a mission whose last update was hours ago is very
+ * likely to hit a GONE/not_found session on the backend — or worse, land
+ * the user's prompt in a disjointed new thread. Past this threshold the
+ * mission is transitioned to `failed` with an actionable message so the
+ * user can explicitly retry instead of the agent silently replaying a
+ * half-finished prompt. 30 minutes is conservative: it covers lunch/
+ * meeting gaps while still protecting against overnight reconnects.
+ */
+const MISSION_RECONNECT_MAX_AGE_MS = 30 * 60 * 1000
 /** Initial delay (ms) before auto-reconnecting WebSocket after close */
 const WS_RECONNECT_INITIAL_DELAY_MS = 1_000
 /** Maximum delay (ms) between reconnection attempts (backoff cap) */
@@ -189,6 +223,36 @@ const MISSION_INACTIVITY_TIMEOUT_MS = 90_000 // 90 seconds of stream silence
  * frontend transitions the mission from 'cancelling' to 'failed' as a safety net.
  */
 const CANCEL_ACK_TIMEOUT_MS = 10_000 // 10 seconds
+/**
+ * Maximum time (ms) a mission may sit in 'waiting_input' with no new
+ * assistant/result message before the frontend treats it as stuck and
+ * transitions it to 'failed' (#5936). This state is entered when a streaming
+ * turn ends without a final 'result' message; if the backend never sends
+ * one (lost event, disconnected agent, etc.) the mission would otherwise
+ * hang indefinitely.
+ */
+const WAITING_INPUT_TIMEOUT_MS = 600_000 // 10 minutes
+
+/**
+ * Strip interactive terminal prompt artifacts from agent metadata strings (#5482).
+ * Interactive agents (e.g. copilot-cli) sometimes leak prompt text, ANSI escape
+ * codes, or selection indicators into their description or displayName fields.
+ */
+function stripInteractiveArtifacts(text: string): string {
+  if (!text) return text
+  return text
+    // Remove ANSI escape codes (colors, cursor movement, etc.)
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1B\[[0-9;]*[A-Za-z]/g, '')
+    // Remove interactive prompt indicators (? prompt, > selection, etc.)
+    .replace(/^[?>]\s+/gm, '')
+    // Remove lines that look like interactive menu items
+    .replace(/^\s*[-*]\s+\[.\]\s+/gm, '')
+    // Remove carriage returns and excess whitespace
+    .replace(/\r/g, '')
+    .replace(/\n{2,}/g, '\n')
+    .trim()
+}
 
 /** Pre-converted demo missions for demo mode — showcases all mission types */
 const DEMO_MISSIONS_AS_MISSIONS: Mission[] = DEMO_MISSIONS.map(m => ({
@@ -231,6 +295,28 @@ function loadMissions(): Mission[] {
             context: { ...mission.context, needsReconnect: true }
           }
         }
+        // Missions stuck in 'pending' state after a page reload cannot be resumed —
+        // the backend never received the chat request (we only transition to
+        // 'running' after ensureConnection resolves and wsSend is called), so
+        // replaying it now would risk a duplicate execution on agents that are
+        // not idempotent. Fail the mission with a clear message prompting the
+        // user to retry manually (#5931).
+        if (mission.status === 'pending') {
+          return {
+            ...mission,
+            status: 'failed',
+            currentStep: undefined,
+            updatedAt: new Date(),
+            messages: [
+              ...mission.messages,
+              {
+                id: `msg-pending-reload-${mission.id}-${Date.now()}`,
+                role: 'system' as const,
+                content: 'Page was reloaded before this mission could start. Please retry the mission.',
+                timestamp: new Date() }
+            ]
+          }
+        }
         // Missions stuck in 'cancelling' after a page reload should be finalized
         if (mission.status === 'cancelling') {
           return {
@@ -240,7 +326,7 @@ function loadMissions(): Mission[] {
             messages: [
               ...mission.messages,
               {
-                id: `msg-${Date.now()}`,
+                id: `msg-cancel-${mission.id}-${Date.now()}`,
                 role: 'system' as const,
                 content: 'Mission cancelled by user (page was reloaded during cancellation).',
                 timestamp: new Date() }
@@ -284,19 +370,31 @@ function saveMissions(missions: Mission[]) {
       )
       // Keep saved/library missions unconditionally — they are small (no chat history)
       const saved = missions.filter(m => m.status === 'saved')
-      // Only prune completed/failed missions by age
+      // Only prune completed/failed/cancelled missions by age (#5935)
       const completedOrFailed = missions
-        .filter(m => m.status === 'completed' || m.status === 'failed')
+        .filter(m => m.status === 'completed' || m.status === 'failed' || m.status === 'cancelled')
         .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
         .slice(0, MAX_COMPLETED_MISSIONS)
       const pruned = [...active, ...saved, ...completedOrFailed]
       try {
         localStorage.setItem(MISSIONS_STORAGE_KEY, JSON.stringify(pruned))
         return
-      } catch (retryError) {
-        // Still too large — clear missions storage as last resort
-        console.error('[Missions] localStorage still full after pruning, clearing missions', retryError)
-        localStorage.removeItem(MISSIONS_STORAGE_KEY)
+      } catch {
+        // Still too large — strip chat messages from completed missions (#5695)
+        console.warn('[Missions] still full after count-pruning, stripping chat messages')
+        const stripped = pruned.map(m =>
+          (m.status === 'completed' || m.status === 'failed' || m.status === 'cancelled')
+            ? { ...m, messages: m.messages.slice(-3) } // keep only last 3 messages
+            : m
+        )
+        try {
+          localStorage.setItem(MISSIONS_STORAGE_KEY, JSON.stringify(stripped))
+          return
+        } catch {
+          // Absolute last resort — clear missions storage
+          console.error('[Missions] localStorage still full after stripping messages, clearing missions')
+          localStorage.removeItem(MISSIONS_STORAGE_KEY)
+        }
       }
     } else {
       console.error('Failed to save missions to localStorage:', e)
@@ -346,6 +444,25 @@ export function MissionProvider({ children }: { children: ReactNode }) {
   const lastStreamTimestamp = useRef<Map<string, number>>(new Map()) // missionId -> timestamp
   // Track cancel acknowledgment timeouts — missionId -> timeout handle
   const cancelTimeouts = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  /**
+   * Mission IDs for which cancellation has been requested by the user.
+   *
+   * This ref is set synchronously at the very top of `cancelMission` so that
+   * a terminal WebSocket message (result / stream-done) arriving in the same
+   * event-loop tick can still observe the cancel intent even if React has not
+   * yet committed the 'cancelling' status transition (#6370). Without this
+   * ref, the race between `cancelMission`'s `setMissions` update and the
+   * result handler's `setMissions` update could leave the mission stuck in
+   * 'completed' instead of transitioning cancelling → cancelled.
+   *
+   * Entries are cleared when `finalizeCancellation` runs or when a retry
+   * reuses the mission ID via `executeMission`.
+   */
+  const cancelIntents = useRef<Set<string>>(new Set())
+  // Track waiting_input watchdog timers — missionId -> timeout handle (#5936).
+  // Prevents missions from getting stuck in 'waiting_input' indefinitely if
+  // the backend never delivers a final result message.
+  const waitingInputTimeouts = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   // Ref to always hold the latest missions state — avoids stale closure in sendMessage (#3322)
   const missionsRef = useRef<Mission[]>(missions)
   missionsRef.current = missions
@@ -365,6 +482,33 @@ export function MissionProvider({ children }: { children: ReactNode }) {
   const wsReconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Tracks consecutive reconnection attempts for exponential backoff (#3870)
   const wsReconnectAttempts = useRef(0)
+  /**
+   * #6375 — Flips true only after the first application-layer message has
+   * been received on the current WebSocket. Used to gate the exponential
+   * backoff reset. A pure transport `onopen` is NOT enough: corporate WAFs
+   * can let the TCP/TLS handshake through but drop the WebSocket upgrade
+   * frame, causing `onopen` to fire and `onclose` to fire in the same tick.
+   * Without this guard, `wsReconnectAttempts` was reset on every `onopen`
+   * and the backoff never grew past the initial delay.
+   */
+  const connectionEstablished = useRef(false)
+  /**
+   * #6376 — Set of missionIds currently executing a background tool call.
+   * While a mission has an in-flight tool (tool_exec / tool_use / tool_call
+   * frame observed but no matching tool_result yet), the inactivity
+   * watchdog is paused for that mission. Kubernetes tool calls can legally
+   * take several minutes (waiting on a LoadBalancer, a long kubectl wait,
+   * etc.) and failing the mission mid-tool would leave the cluster in a
+   * partially-mutated state while the agent keeps running server-side.
+   */
+  const toolsInFlight = useRef<Map<string, number>>(new Map()) // missionId -> openToolCount
+  /**
+   * #6378 — Monotonic counter per mission used to build unique React keys
+   * when a streaming message is split into a new bubble after STREAM_GAP_THRESHOLD_MS.
+   * Two splits within the same millisecond previously collided on
+   * `msg-${Date.now()}` and caused React key warnings + rendering glitches.
+   */
+  const streamSplitCounter = useRef<Map<string, number>>(new Map())
   const STREAM_GAP_THRESHOLD_MS = 8000 // If >8s gap between stream chunks, create new message bubble (tool-use gap)
 
   // Maximum number of WebSocket send retries before giving up
@@ -423,6 +567,19 @@ export function MissionProvider({ children }: { children: ReactNode }) {
       setMissions(prev => {
         const hasIssue = prev.some(m => {
           if (m.status !== 'running') return false
+          // #6376 — pause inactivity check while a background tool call is
+          // in flight. Long-running Kubernetes operations (wait for LB,
+          // kubectl wait, long helm install) can legitimately exceed the
+          // 90s stream-silence window, and failing the mission mid-tool
+          // leaves the cluster partially mutated while the agent keeps
+          // working server-side.
+          const openTools = toolsInFlight.current.get(m.id) ?? 0
+          if (openTools > 0) {
+            // Still enforce the hard 5-minute total timeout, but not the
+            // stream-silence timeout.
+            if ((now - new Date(m.updatedAt).getTime()) > MISSION_TIMEOUT_MS) return true
+            return false
+          }
           if ((now - new Date(m.updatedAt).getTime()) > MISSION_TIMEOUT_MS) return true
           const lastStreamTs = lastStreamTimestamp.current.get(m.id)
           if (lastStreamTs && (now - lastStreamTs) > MISSION_INACTIVITY_TIMEOUT_MS) return true
@@ -435,7 +592,10 @@ export function MissionProvider({ children }: { children: ReactNode }) {
 
           const elapsed = now - new Date(m.updatedAt).getTime()
           const lastStreamTs = lastStreamTimestamp.current.get(m.id)
-          const isInactive = !!lastStreamTs && (now - lastStreamTs) > MISSION_INACTIVITY_TIMEOUT_MS
+          const openTools = toolsInFlight.current.get(m.id) ?? 0
+          // #6376 — see comment above: while a tool call is in flight, only
+          // the total 5-minute timeout can fire, not the stream-silence one.
+          const isInactive = openTools === 0 && !!lastStreamTs && (now - lastStreamTs) > MISSION_INACTIVITY_TIMEOUT_MS
           const isTimedOut = elapsed > MISSION_TIMEOUT_MS
 
           if (!isTimedOut && !isInactive) return m
@@ -446,7 +606,13 @@ export function MissionProvider({ children }: { children: ReactNode }) {
           }
           lastStreamTimestamp.current.delete(m.id)
 
-          emitMissionError(m.type, isInactive ? 'mission_inactivity' : 'mission_timeout')
+          emitMissionError(
+            m.type,
+            isInactive ? 'mission_inactivity' : 'mission_timeout',
+            isInactive
+              ? `stalled_after_${Math.round((now - (lastStreamTs ?? now)) / 1000)}s`
+              : `elapsed_${Math.round(elapsed / 1000)}s`
+          )
 
           const errorContent = isInactive
             ? `**Agent Not Responding**\n\nThe AI agent started responding but stopped for over ${Math.round(MISSION_INACTIVITY_TIMEOUT_MS / 60_000)} minutes. This usually means the agent is stuck waiting for a tool call to return (e.g., a Kubernetes API call or APISIX gateway request that is not responding).\n\nYou can:\n- **Retry** the mission — the issue may be transient\n- **Check cluster connectivity** — ensure the target cluster API server is reachable\n- **Cancel** and try a simpler or more specific request`
@@ -514,12 +680,19 @@ export function MissionProvider({ children }: { children: ReactNode }) {
       }, WS_CONNECTION_TIMEOUT_MS)
 
       try {
+        // #6375 — arm the "not yet established" guard for this socket.
+        // The backoff is reset later, after the first application-layer
+        // message actually arrives, not here.
+        connectionEstablished.current = false
         wsRef.current = new WebSocket(LOCAL_AGENT_WS_URL)
 
         wsRef.current.onopen = () => {
           clearTimeout(timeout)
-          // Reset reconnection backoff on successful connection (#3870)
-          wsReconnectAttempts.current = 0
+          // NOTE: Do NOT reset wsReconnectAttempts here. Corporate WAFs can
+          // let the TCP/TLS handshake through and still drop the WebSocket
+          // upgrade frame, causing onopen → onclose in the same event-loop
+          // tick. The backoff is reset in handleAgentMessage on the first
+          // real application-layer frame (#6375).
           // Fetch available agents on connect
           fetchAgents()
 
@@ -529,6 +702,13 @@ export function MissionProvider({ children }: { children: ReactNode }) {
           // React StrictMode may invoke state updaters twice, which would
           // cause duplicate reconnection requests if the send lived inside.
           const missionsToReconnect: Mission[] = []
+          // Missions that have already had one reconnect attempt — don't
+          // replay the prompt again; fail them instead (#5930).
+          const missionsToFailDuplicate: string[] = []
+          // Missions whose last update was so long ago that the backend
+          // session is almost certainly gone. Don't auto-resume these —
+          // mark them as needing a manual restart (#6371).
+          const missionsToMarkStale: string[] = []
 
           setMissions(prev => {
             const candidates = prev.filter(m =>
@@ -536,19 +716,72 @@ export function MissionProvider({ children }: { children: ReactNode }) {
             )
 
             if (candidates.length > 0) {
-              // Snapshot missions for the side effect scheduled below
-              missionsToReconnect.push(...candidates)
+              // Split candidates into first-attempt (safe to replay) vs
+              // already-attempted (unsafe — would duplicate execution on
+              // non-idempotent agents, see #5930) vs stale (backend session
+              // has very likely expired, see #6371).
+              const now = Date.now()
+              for (const m of candidates) {
+                const ageMs = now - new Date(m.updatedAt).getTime()
+                if (ageMs > MISSION_RECONNECT_MAX_AGE_MS) {
+                  missionsToMarkStale.push(m.id)
+                } else if (m.context?.reconnectAttempted) {
+                  missionsToFailDuplicate.push(m.id)
+                } else {
+                  missionsToReconnect.push(m)
+                }
+              }
 
-              // Clear the needsReconnect flag and update step (pure state update)
-              return prev.map(m =>
-                m.context?.needsReconnect
-                  ? {
-                      ...m,
-                      currentStep: 'Resuming...',
-                      context: { ...m.context, needsReconnect: false }
-                    }
-                  : m
-              )
+              // Clear the needsReconnect flag and mark reconnectAttempted
+              // so a subsequent reconnect won't replay the prompt again.
+              return prev.map(m => {
+                if (!m.context?.needsReconnect) return m
+                if (missionsToMarkStale.includes(m.id)) {
+                  // #6384 item 2 (dup of #6380) — rely on status 'failed' +
+                  // the explicit system message to prompt the user to retry.
+                  // A separate `needsRestart` flag was never read anywhere,
+                  // so carrying it here was dead state.
+                  return {
+                    ...m,
+                    status: 'failed' as MissionStatus,
+                    currentStep: undefined,
+                    updatedAt: new Date(),
+                    context: {
+                      ...m.context,
+                      needsReconnect: false },
+                    messages: [
+                      ...m.messages,
+                      {
+                        id: `msg-reconnect-stale-${m.id}-${Date.now()}`,
+                        role: 'system' as const,
+                        content: `**Mission session expired**\n\nThe connection to the agent was lost more than ${Math.round(MISSION_RECONNECT_MAX_AGE_MS / 60_000)} minutes ago. The agent has likely purged this session, so auto-resume is unsafe — it could crash the agent or land your prompt in a disjointed thread.\n\n**Click Retry Mission** to start a fresh session with the same prompt.`,
+                        timestamp: new Date() }
+                    ]
+                  }
+                }
+                if (missionsToFailDuplicate.includes(m.id)) {
+                  return {
+                    ...m,
+                    status: 'failed' as MissionStatus,
+                    currentStep: undefined,
+                    updatedAt: new Date(),
+                    context: { ...m.context, needsReconnect: false },
+                    messages: [
+                      ...m.messages,
+                      {
+                        id: `msg-reconnect-abort-${m.id}-${Date.now()}`,
+                        role: 'system' as const,
+                        content: 'Connection was lost twice during this mission. To avoid duplicating an in-flight action, the mission was stopped. Please retry it manually.',
+                        timestamp: new Date() }
+                    ]
+                  }
+                }
+                return {
+                  ...m,
+                  currentStep: 'Resuming...',
+                  context: { ...m.context, needsReconnect: false, reconnectAttempted: true }
+                }
+              })
             }
             return prev
           })
@@ -565,6 +798,11 @@ export function MissionProvider({ children }: { children: ReactNode }) {
                   // Determine which agent to use - prefer claude-code for tool execution
                   const agentToUse = mission.agent || 'claude-code'
 
+                  // Tag the reconnect with a deterministic resumeKey per
+                  // mission — backends that support resume-by-key can
+                  // de-duplicate on this key and avoid replaying actions
+                  // that were already (partially) processed (#5930).
+                  const resumeKey = `resume-${mission.id}`
                   const requestId = `claude-reconnect-${Date.now()}-${mission.id}`
                   pendingRequests.current.set(requestId, mission.id)
 
@@ -583,7 +821,9 @@ export function MissionProvider({ children }: { children: ReactNode }) {
                       prompt: lastUserMessage.content,
                       sessionId: mId,
                       agent: agentToUse,
-                      history: history }
+                      history: history,
+                      resumeKey: resumeKey,
+                      isResume: true }
                   }), () => {
                     setMissions(prev => prev.map(m =>
                       m.id === mId ? { ...m, status: 'failed', currentStep: 'WebSocket reconnect failed' } : m
@@ -639,31 +879,54 @@ export function MissionProvider({ children }: { children: ReactNode }) {
             )
           }
 
-          // Fail any pending missions that were waiting for a response
+          // Transient disconnect handling (#5929): instead of failing running
+          // missions immediately, mark them with needsReconnect so that the
+          // auto-reconnect loop (above) can resume them once the WebSocket
+          // re-opens. We only fail missions permanently when the reconnect
+          // retries have been exhausted (handled in the `else if` branch
+          // below). The pending request IDs are cleared because a new request
+          // ID will be issued on reconnect — keeping them would cause late
+          // responses from the dead socket to be misattributed (#4499).
+          const isGivingUp = getDemoMode() || wsReconnectAttempts.current >= WS_RECONNECT_MAX_RETRIES
           if (pendingRequests.current.size > 0) {
-            const errorContent = `**Local Agent Not Connected**
-
-Install the console locally with the KubeStellar Console agent to use AI missions.`
-
             const pendingMissionIds = new Set(pendingRequests.current.values())
-            setMissions(prev => prev.map(m => {
-              if (pendingMissionIds.has(m.id) && m.status === 'running') {
-                return {
-                  ...m,
-                  status: 'failed',
-                  currentStep: undefined,
-                  messages: [
-                    ...m.messages,
-                    {
-                      id: `msg-${Date.now()}-${m.id}`,
-                      role: 'system',
-                      content: errorContent,
-                      timestamp: new Date() }
-                  ]
+
+            if (isGivingUp) {
+              const errorContent = `**Agent Disconnected**
+
+The WebSocket connection to the agent at \`${LOCAL_AGENT_WS_URL}\` was lost and reconnection attempts were exhausted. Please verify the agent is running and reachable, then retry the mission.`
+              setMissions(prev => prev.map(m => {
+                if (pendingMissionIds.has(m.id) && m.status === 'running') {
+                  return {
+                    ...m,
+                    status: 'failed',
+                    currentStep: undefined,
+                    messages: [
+                      ...m.messages,
+                      {
+                        id: `msg-${Date.now()}-${m.id}`,
+                        role: 'system',
+                        content: errorContent,
+                        timestamp: new Date() }
+                    ]
+                  }
                 }
-              }
-              return m
-            }))
+                return m
+              }))
+            } else {
+              // Transient disconnect — keep mission in 'running' but mark it
+              // as needing reconnect. The UI will show "Reconnecting..." and
+              // the onopen handler will resume the mission automatically.
+              setMissions(prev => prev.map(m => {
+                if (pendingMissionIds.has(m.id) && m.status === 'running') {
+                  return {
+                    ...m,
+                    currentStep: 'Reconnecting...',
+                    context: { ...m.context, needsReconnect: true } }
+                }
+                return m
+              }))
+            }
             pendingRequests.current.clear()
           }
         }
@@ -679,6 +942,50 @@ Install the console locally with the KubeStellar Console agent to use AI mission
             ws.close()
             wsRef.current = null
           }
+          // Transient disconnect handling (#5929): only fail missions
+          // permanently when reconnection attempts are exhausted. Otherwise
+          // mark them as needing reconnect so onopen can resume them.
+          // Don't sweep all running missions — only those tied to pending
+          // requests, as others may belong to a different WS session (#5851).
+          const isGivingUp = getDemoMode() || wsReconnectAttempts.current >= WS_RECONNECT_MAX_RETRIES
+          if (pendingRequests.current.size > 0) {
+            const affectedMissionIds = new Set(pendingRequests.current.values())
+            if (isGivingUp) {
+              const errorContent = `**Agent Disconnected**\n\nThe WebSocket connection failed and reconnection attempts were exhausted. Please verify the agent is running and try again.`
+              setMissions(prev => prev.map(m => {
+                if (!affectedMissionIds.has(m.id)) return m
+                if (m.status !== 'running' && m.status !== 'waiting_input') return m
+                return { ...m, status: 'failed' as MissionStatus, currentStep: 'Connection failed',
+                  messages: [...m.messages, { id: `msg-${Date.now()}-ws-error`, role: 'system' as const, content: errorContent, timestamp: new Date() }] }
+              }))
+            } else {
+              setMissions(prev => prev.map(m => {
+                if (!affectedMissionIds.has(m.id)) return m
+                if (m.status !== 'running' && m.status !== 'waiting_input') return m
+                return { ...m, currentStep: 'Reconnecting...', context: { ...m.context, needsReconnect: true } }
+              }))
+            }
+            pendingRequests.current.clear()
+          }
+          // #6377 — belt-and-suspenders: always clear any lingering
+          // pendingRequests entries on a hard error, even if the size === 0
+          // branch above wasn't entered. Late responses from the dead
+          // socket must not be misattributed.
+          pendingRequests.current.clear()
+          // #6376 — drop any tool-in-flight tracking for the dead socket;
+          // the agent will re-report status after the reconnect.
+          toolsInFlight.current.clear()
+          // #6410 — also clear the remaining per-mission tracking state so
+          // nothing is carried over from the dead socket. `waitingInputTimeouts`
+          // holds real setTimeout handles and must be clearTimeout'd first
+          // (just `.clear()` would leak the timers and they could fire after
+          // reconnect, flipping missions to `failed`).
+          for (const t of waitingInputTimeouts.current.values()) {
+            clearTimeout(t)
+          }
+          waitingInputTimeouts.current.clear()
+          lastStreamTimestamp.current.clear()
+          streamSplitCounter.current.clear()
           setAgentsLoading(false)
           reject(new Error('CONNECTION_FAILED'))
         }
@@ -702,8 +1009,59 @@ Install the console locally with the KubeStellar Console agent to use AI mission
     }
   }
 
-  // Finalize a cancelling mission — transitions from 'cancelling' to 'failed'
-  // and clears any pending cancel timeout.
+  // Clear the waiting_input watchdog timer for a mission, if one is set (#5936).
+  const clearWaitingInputTimeout = (missionId: string) => {
+    const t = waitingInputTimeouts.current.get(missionId)
+    if (t) {
+      clearTimeout(t)
+      waitingInputTimeouts.current.delete(missionId)
+    }
+  }
+
+  // Start (or restart) the waiting_input watchdog for a mission (#5936).
+  // If the mission is still in 'waiting_input' after WAITING_INPUT_TIMEOUT_MS,
+  // it is transitioned to 'failed' with an actionable error message. This
+  // prevents the UI from hanging forever when a backend 'result' message is
+  // lost or the agent disconnects silently after streaming ends.
+  const startWaitingInputTimeout = (missionId: string) => {
+    clearWaitingInputTimeout(missionId)
+    const handle = setTimeout(() => {
+      waitingInputTimeouts.current.delete(missionId)
+      // Purge pending request IDs for this mission — late responses must not
+      // overwrite the failed state.
+      for (const [reqId, mId] of pendingRequests.current.entries()) {
+        if (mId === missionId) pendingRequests.current.delete(reqId)
+      }
+      lastStreamTimestamp.current.delete(missionId)
+      setMissions(prev => prev.map(m => {
+        if (m.id !== missionId || m.status !== 'waiting_input') return m
+        emitMissionError(
+          m.type,
+          'waiting_input_timeout',
+          `timeout_after_${Math.round(WAITING_INPUT_TIMEOUT_MS / 1000)}s`
+        )
+        return {
+          ...m,
+          status: 'failed' as MissionStatus,
+          currentStep: undefined,
+          updatedAt: new Date(),
+          messages: [
+            ...m.messages,
+            {
+              id: `msg-waiting-timeout-${Date.now()}-${m.id}`,
+              role: 'system' as const,
+              content: `**No response from agent — mission timed out waiting for input.**\n\nThe agent finished streaming but never delivered a final result within ${Math.round(WAITING_INPUT_TIMEOUT_MS / 60_000)} minutes. This usually means the final result message was lost or the agent disconnected silently.\n\nYou can:\n- **Retry** the mission — the issue may be transient\n- **Check your agent** — make sure it is still running and reachable\n- **Send a new message** to continue the conversation`,
+              timestamp: new Date() }
+          ]
+        }
+      }))
+    }, WAITING_INPUT_TIMEOUT_MS)
+    waitingInputTimeouts.current.set(missionId, handle)
+  }
+
+  // Finalize a cancelling mission — transitions from 'cancelling' to 'cancelled'
+  // (a distinct terminal state from 'failed', #5935) and clears any pending
+  // cancel timeout.
   const finalizeCancellation = (missionId: string, message: string) => {
     // Clear the timeout if one is pending
     const timeout = cancelTimeouts.current.get(missionId)
@@ -711,6 +1069,8 @@ Install the console locally with the KubeStellar Console agent to use AI mission
       clearTimeout(timeout)
       cancelTimeouts.current.delete(missionId)
     }
+    // #6370 — clear the cancel intent now that we're finalizing.
+    cancelIntents.current.delete(missionId)
 
     // Purge ALL pending request IDs that map to this mission so that late
     // responses (from earlier failed or in-flight requests) are dropped at
@@ -719,11 +1079,21 @@ Install the console locally with the KubeStellar Console agent to use AI mission
       if (mId === missionId) pendingRequests.current.delete(reqId)
     }
     lastStreamTimestamp.current.delete(missionId)
+    streamSplitCounter.current.delete(missionId) // #6410 — terminal state cleanup
+    toolsInFlight.current.delete(missionId) // #6410 — terminal state cleanup
+    clearWaitingInputTimeout(missionId) // #5936
 
-    setMissions(prev => prev.map(m =>
-      m.id === missionId && m.status === 'cancelling' ? {
+    setMissions(prev => prev.map(m => {
+      if (m.id !== missionId) return m
+      // Accept any non-terminal status here (not just 'cancelling') because
+      // the cancel intent may have been recorded synchronously while the
+      // 'cancelling' state transition was still queued (#6370). We never
+      // overwrite a completed/failed/cancelled mission — those are the
+      // true terminal states.
+      if (m.status === 'completed' || m.status === 'failed' || m.status === 'cancelled') return m
+      return {
         ...m,
-        status: 'failed',
+        status: 'cancelled' as MissionStatus,
         currentStep: undefined,
         updatedAt: new Date(),
         messages: [
@@ -734,16 +1104,33 @@ Install the console locally with the KubeStellar Console agent to use AI mission
             content: message,
             timestamp: new Date() }
         ]
-      } : m
-    ))
+      }
+    }))
   }
 
   // Handle messages from the agent
   const handleAgentMessage = (message: { id: string; type: string; payload?: unknown }) => {
+    // #6375 — First real application-layer frame on this socket means the
+    // WebSocket upgrade succeeded all the way through any intermediaries.
+    // Only now is it safe to reset the reconnection backoff. Transport-level
+    // `onopen` is not sufficient because some WAFs complete the TCP handshake
+    // and silently drop the WS upgrade frame, causing onopen → onclose in the
+    // same tick and a backoff-reset storm.
+    if (!connectionEstablished.current) {
+      connectionEstablished.current = true
+      wsReconnectAttempts.current = 0
+    }
     // Handle agent-related messages (no mission ID needed)
     if (message.type === 'agents_list') {
       const payload = message.payload as AgentsListPayload
-      setAgents(payload.agents)
+      // Sanitize agent metadata — strip interactive prompt artifacts that leak
+      // from terminal-based agents (e.g. copilot-cli) into description fields (#5482).
+      const sanitizedAgents = payload.agents.map(agent => ({
+        ...agent,
+        description: stripInteractiveArtifacts(agent.description),
+        displayName: stripInteractiveArtifacts(agent.displayName),
+      }))
+      setAgents(sanitizedAgents)
       setDefaultAgent(payload.defaultAgent)
       // Prefer persisted selection if the agent is still available.
       // If persisted is 'none' but an agent IS available, auto-select it
@@ -753,16 +1140,21 @@ Install the console locally with the KubeStellar Console agent to use AI mission
       const persistedAvailable = persisted && persisted !== 'none' && payload.agents.some(a => a.name === persisted && a.available)
 
       // When auto-selecting, prefer agents that execute commands directly over
-      // agents that only suggest commands (e.g. copilot-cli). This prevents
-      // missions from returning kubectl commands as text instead of running them (#3609).
-      const SUGGEST_ONLY_AGENTS = new Set(['copilot-cli', 'gh-copilot'])
+      // agents that only suggest commands (e.g. copilot-cli). Interactive/suggest-only
+      // agents produce terminal prompts instead of executing missions (#3609, #5481).
+      const INTERACTIVE_AGENTS = new Set(['copilot-cli', 'gh-copilot'])
       const bestAvailable = hasAvailableAgent
-        ? (payload.agents.find(a => a.available && ((a.capabilities ?? 0) & AgentCapabilityToolExec) !== 0 && !SUGGEST_ONLY_AGENTS.has(a.name))?.name
-          || payload.agents.find(a => a.available && !SUGGEST_ONLY_AGENTS.has(a.name))?.name
+        ? (payload.agents.find(a => a.available && ((a.capabilities ?? 0) & AgentCapabilityToolExec) !== 0 && !INTERACTIVE_AGENTS.has(a.name))?.name
+          || payload.agents.find(a => a.available && !INTERACTIVE_AGENTS.has(a.name))?.name
           || payload.agents.find(a => a.available)?.name
           || null)
         : null
-      const resolved = persistedAvailable ? persisted : (payload.selected || payload.defaultAgent || bestAvailable)
+      // Filter the backend's defaultAgent if it is interactive — fall through to
+      // bestAvailable which already excludes interactive agents (#5481).
+      const safeDefaultAgent = payload.defaultAgent && !INTERACTIVE_AGENTS.has(payload.defaultAgent)
+        ? payload.defaultAgent
+        : null
+      const resolved = persistedAvailable ? persisted : (payload.selected || safeDefaultAgent || bestAvailable)
       setSelectedAgent(resolved)
       // If we restored a persisted agent that differs from the server's selection, tell the server
       if (persistedAvailable && persisted !== payload.selected && wsRef.current?.readyState === WebSocket.OPEN) {
@@ -802,14 +1194,69 @@ Install the console locally with the KubeStellar Console agent to use AI mission
     const missionId = pendingRequests.current.get(message.id)
     if (!missionId) return
 
+    // #6376 — Track background tool-call lifecycle so the inactivity watchdog
+    // can pause while a long-running Kubernetes tool is in flight. The agent
+    // protocol actually surfaces tool lifecycle events as `type: 'progress'`
+    // frames with tool metadata in the payload (see `onProgress` in
+    // pkg/agent/server_ai.go). A tool-start frame has `payload.tool` set and
+    // no `payload.output`; a tool-result frame has `payload.tool` set AND
+    // `payload.output` populated (truncated stdout). Count each shape as +1
+    // or -1 respectively. Earlier revisions of this code keyed on
+    // `tool_exec`/`tool_use`/`tool_call`/`tool_result`/`tool_done` message
+    // types that never reach the frontend — that branch was dead code.
+    if (message.type === 'progress') {
+      const progressPayload = (message.payload ?? {}) as {
+        tool?: string
+        output?: string
+      }
+      if (progressPayload.tool) {
+        if (progressPayload.output) {
+          // Tool completed — decrement.
+          const prevCount = toolsInFlight.current.get(missionId) ?? 0
+          const next = Math.max(0, prevCount - 1)
+          if (next === 0) toolsInFlight.current.delete(missionId)
+          else toolsInFlight.current.set(missionId, next)
+        } else {
+          // Tool started — increment.
+          const prevCount = toolsInFlight.current.get(missionId) ?? 0
+          toolsInFlight.current.set(missionId, prevCount + 1)
+        }
+        // Bump last stream timestamp so a tool that fires right at the edge
+        // of the silence window doesn't trip the watchdog on the next interval.
+        lastStreamTimestamp.current.set(missionId, Date.now())
+      }
+    }
+
     setMissions(prev => prev.map(m => {
       if (m.id !== missionId) return m
 
       // Discard messages for missions that have already reached a terminal state
-      // (failed, completed). This prevents stale responses from a previously
-      // failed request from overwriting state after cancellation (#4499).
-      if (m.status === 'failed' || m.status === 'completed') {
+      // (failed, completed, cancelled). This prevents stale responses from a
+      // previously failed request from overwriting state after cancellation
+      // (#4499, #5935).
+      if (m.status === 'failed' || m.status === 'completed' || m.status === 'cancelled') {
         pendingRequests.current.delete(message.id)
+        return m
+      }
+
+      // #6370 — If cancellation has been REQUESTED (even if the 'cancelling'
+      // state transition has not yet been committed by React), treat any
+      // terminal message as implicit cancel confirmation. Without this the
+      // result handler below could race with `cancelMission`'s state update
+      // and overwrite the cancellation intent with a 'completed' status.
+      if (cancelIntents.current.has(missionId)) {
+        const isTerminalMessage =
+          message.type === 'result' ||
+          message.type === 'error' ||
+          (message.type === 'stream' && (message.payload as { done?: boolean })?.done)
+        if (isTerminalMessage) {
+          pendingRequests.current.delete(message.id)
+          finalizeCancellation(missionId, 'Mission cancelled by user.')
+          return m
+        }
+        // Non-terminal stream chunks while a cancel is in flight: drop them
+        // so we don't flash the latest chunk into the UI right before the
+        // mission transitions to 'cancelled'.
         return m
       }
 
@@ -840,22 +1287,26 @@ Install the console locally with the KubeStellar Console agent to use AI mission
         // Reset inactivity timer — progress events prove the agent is alive,
         // even during long-running tool calls like `drasi init` (#5360).
         lastStreamTimestamp.current.set(missionId, Date.now())
-        // Track token delta for category usage
-        if (payload.tokens?.total) {
+        // Track token delta for category usage — guard against NaN from
+        // malformed WebSocket payloads to prevent corrupted state (#5838)
+        const safeTotal = Number(payload.tokens?.total)
+        if (!Number.isNaN(safeTotal) && safeTotal > 0) {
           const previousTotal = m.tokenUsage?.total ?? 0
-          const delta = payload.tokens.total - previousTotal
+          const delta = safeTotal - previousTotal
           if (delta > 0) {
             addCategoryTokens(delta, 'missions')
           }
         }
+        const safeInput = Number(payload.tokens?.input)
+        const safeOutput = Number(payload.tokens?.output)
         return {
           ...m,
           currentStep: payload.step || m.currentStep,
           progress: payload.progress ?? m.progress,
           tokenUsage: payload.tokens ? {
-            input: payload.tokens.input ?? m.tokenUsage?.input ?? 0,
-            output: payload.tokens.output ?? m.tokenUsage?.output ?? 0,
-            total: payload.tokens.total ?? m.tokenUsage?.total ?? 0 } : m.tokenUsage,
+            input: !Number.isNaN(safeInput) ? safeInput : (m.tokenUsage?.input ?? 0),
+            output: !Number.isNaN(safeOutput) ? safeOutput : (m.tokenUsage?.output ?? 0),
+            total: !Number.isNaN(safeTotal) ? safeTotal : (m.tokenUsage?.total ?? 0) } : m.tokenUsage,
           updatedAt: new Date() }
       } else if (message.type === 'stream') {
         // Streaming response from agent
@@ -890,7 +1341,14 @@ Install the console locally with the KubeStellar Console agent to use AI mission
             ]
           }
         } else if (!payload.done && payload.content) {
-          // First chunk OR gap detected - create new assistant message
+          // First chunk OR gap detected - create new assistant message.
+          // #6378 — Include a monotonic per-mission split counter in the key
+          // so two splits within the same millisecond (timer resolution on
+          // some platforms is 1ms; two chunks coming back-to-back after a
+          // tool-use gap is common) don't collide on Date.now() alone and
+          // trigger React "duplicate key" warnings + rendering glitches.
+          const splitIndex = (streamSplitCounter.current.get(missionId) ?? 0) + 1
+          streamSplitCounter.current.set(missionId, splitIndex)
           return {
             ...m,
             status: 'running' as MissionStatus,
@@ -900,7 +1358,7 @@ Install the console locally with the KubeStellar Console agent to use AI mission
             messages: [
               ...m.messages,
               {
-                id: `msg-${Date.now()}`,
+                id: `msg-${Date.now()}-s${splitIndex}`,
                 role: 'assistant' as const,
                 content: payload.content,
                 timestamp: new Date(),
@@ -925,11 +1383,16 @@ Install the console locally with the KubeStellar Console agent to use AI mission
             }
           }
 
-          // Clear active token tracking
-          setActiveTokenCategory(null)
-          if (m.status === 'running') {
-            emitMissionCompleted(m.type, Math.round((Date.now() - m.createdAt.getTime()) / 1000))
-          }
+          // Clear active token tracking for this specific mission (#6016 —
+          // per-operation tracking so concurrent missions don't clobber each
+          // other's category).
+          // NOTE: Do NOT emit analytics completion here — stream-done is not
+          // authoritative. The backend sends a separate 'result' message with
+          // the final answer; emitMissionCompleted fires there (#5510).
+          clearActiveTokenCategory(missionId)
+          // Start the watchdog that auto-fails the mission if no final result
+          // message arrives within WAITING_INPUT_TIMEOUT_MS (#5936).
+          startWaitingInputTimeout(missionId)
           return {
             ...m,
             status: 'waiting_input' as MissionStatus,
@@ -940,6 +1403,11 @@ Install the console locally with the KubeStellar Console agent to use AI mission
         // Complete response - mark as unread
         const payload = message.payload as ChatStreamPayload | { content?: string; output?: string }
         pendingRequests.current.delete(message.id)
+        clearWaitingInputTimeout(missionId) // #5936 — result received, cancel watchdog
+        // #6410 — mission reached terminal state; drop its per-mission tracking.
+        streamSplitCounter.current.delete(missionId)
+        toolsInFlight.current.delete(missionId)
+        lastStreamTimestamp.current.delete(missionId)
         markMissionAsUnread(missionId)
 
         // Extract token usage if available
@@ -958,8 +1426,9 @@ Install the console locally with the KubeStellar Console agent to use AI mission
           }
         }
 
-        // Clear active token tracking and emit completion event
-        setActiveTokenCategory(null)
+        // Clear active token tracking for this mission and emit completion
+        // event (#6016 — per-operation tracking keyed by missionId).
+        clearActiveTokenCategory(missionId)
         if (m.status === 'running') {
           emitMissionCompleted(m.type, Math.round((Date.now() - m.createdAt.getTime()) / 1000))
         }
@@ -973,14 +1442,42 @@ Install the console locally with the KubeStellar Console agent to use AI mission
           .filter(msg => msg.role === 'assistant')
           .map(msg => msg.content)
           .join('')
-        // Skip adding result message if content was already received via streaming
-        const alreadyStreamed = streamedSinceUser.length > 0 &&
-          resultContent.length > 0 &&
-          streamedSinceUser.startsWith(resultContent.slice(0, Math.min(resultContent.length, streamedSinceUser.length)))
 
+        // #5948 — Dedupe streamed vs final response.
+        //
+        // Previously this check used `streamedSinceUser.startsWith(resultContent.slice(...))`
+        // which only matched when the streamed content EXACTLY started with the
+        // final result. Small differences (trailing whitespace, newline chunks,
+        // punctuation added in the final pass, or the result arriving as a
+        // suffix of the stream) caused the dedupe to miss and the same
+        // assistant response was appended a second time.
+        //
+        // The new check normalizes whitespace and matches in BOTH directions
+        // (streamed contains result OR result contains streamed). This catches
+        // the common cases where the two differ only in trivial formatting.
+        /** Collapse whitespace + trim so trivial formatting differences don't defeat dedupe. */
+        const normalize = (s: string): string => s.replace(/\s+/g, ' ').trim()
+        const normalizedStreamed = normalize(streamedSinceUser)
+        const normalizedResult = normalize(resultContent)
+        /** Minimum content length required before we consider an overlap a real dedupe match. */
+        const DEDUPE_MIN_CONTENT_LEN = 1
+        const alreadyStreamed =
+          normalizedStreamed.length >= DEDUPE_MIN_CONTENT_LEN &&
+          normalizedResult.length >= DEDUPE_MIN_CONTENT_LEN &&
+          (
+            normalizedStreamed === normalizedResult ||
+            normalizedStreamed.includes(normalizedResult) ||
+            normalizedResult.includes(normalizedStreamed)
+          )
+
+        // Transition to 'completed' when a result message arrives — this is the
+        // backend's final answer for the current turn. The 'waiting_input' state
+        // is only used while streaming is in progress (stream done w/o result).
+        // The UI shows a completion panel with feedback buttons when status is
+        // 'completed', so reaching this state is the correct lifecycle end (#5479).
         return {
           ...m,
-          status: 'waiting_input' as MissionStatus,
+          status: 'completed' as MissionStatus,
           currentStep: undefined,
           updatedAt: new Date(),
           agent: chatPayload.agent || m.agent,
@@ -998,7 +1495,12 @@ Install the console locally with the KubeStellar Console agent to use AI mission
       } else if (message.type === 'error') {
         const payload = message.payload as { code?: string; message?: string }
         pendingRequests.current.delete(message.id)
-        emitMissionError(m.type, payload.code || 'unknown')
+        clearWaitingInputTimeout(missionId) // #5936 — terminal error, cancel watchdog
+        // #6410 — mission reached terminal state; drop its per-mission tracking.
+        streamSplitCounter.current.delete(missionId)
+        toolsInFlight.current.delete(missionId)
+        lastStreamTimestamp.current.delete(missionId)
+        emitMissionError(m.type, payload.code || 'unknown', payload.message)
 
         // Create helpful error message based on error code
         let errorContent = payload.message || 'Unknown error'
@@ -1220,16 +1722,48 @@ Install the console locally with the KubeStellar Console agent to use AI mission
             ]
           } : m
         ))
-        emitMissionError(params.type || 'custom', preflight.error?.code || 'preflight_unknown')
+        emitMissionError(
+          params.type || 'custom',
+          preflight.error?.code || 'preflight_unknown',
+          preflight.error?.message
+        )
         return
       }
 
+      // #6384 item 1 (dup of #6381) — if the user clicked Cancel while
+      // preflight was running, honor the cancel instead of firing the
+      // request off to the agent. Without this guard, executeMission would
+      // race with cancelMission and the mission would end up in 'running'
+      // despite a cancel being in flight.
+      if (cancelIntents.current.has(missionId)) {
+        finalizeCancellation(missionId, 'Mission cancelled by user before execution started.')
+        return
+      }
       // Preflight passed — proceed to send to agent
       executeMission(missionId, enhancedPrompt, params)
-    }).catch(() => {
-      // Preflight itself threw unexpectedly — still allow mission to proceed
-      // (don't block on preflight infrastructure failures)
-      executeMission(missionId, enhancedPrompt, params)
+    }).catch((err) => {
+      // Preflight itself threw unexpectedly — block the mission instead of
+      // fail-open to prevent executing without validation (#5846)
+      setMissions(prev => prev.map(m =>
+        m.id === missionId ? {
+          ...m,
+          status: 'blocked' as MissionStatus,
+          currentStep: 'Preflight check error',
+          preflightError: {
+            code: 'UNKNOWN_EXECUTION_FAILURE',
+            message: err instanceof Error ? err.message : 'Unknown error',
+            details: { hint: 'The preflight check threw an unexpected error. Retry or check cluster connectivity.' },
+          },
+          messages: [
+            ...m.messages,
+            {
+              id: `msg-${Date.now()}-preflight-error`,
+              role: 'system' as const,
+              content: `**Preflight Check Error**\n\nThe preflight check encountered an unexpected error. The mission has been blocked to prevent unvalidated execution.\n\nError: ${err instanceof Error ? err.message : 'Unknown error'}`,
+              timestamp: new Date() }
+          ]
+        } : m
+      ))
     })
    
   }
@@ -1287,6 +1821,22 @@ Install the console locally with the KubeStellar Console agent to use AI mission
     enhancedPrompt: string,
     params: { context?: Record<string, unknown>; type?: string },
   ) => {
+    // #6384 item 1 (dup of #6381) — if a cancel intent is already set for
+    // this missionId we must not clear it and proceed to send. This
+    // scenario happens when the user clicks Cancel after preflightAndExecute
+    // kicked off but before executeMission started sending to the agent.
+    // Finalize the cancel and return without contacting the backend.
+    if (cancelIntents.current.has(missionId)) {
+      finalizeCancellation(missionId, 'Mission cancelled by user before execution started.')
+      return
+    }
+    // A retry may reuse a missionId that had a previous cancel intent;
+    // only clear stale entries once we've confirmed no cancel is pending
+    // (#6370). `retryPreflight` and `runSavedMission` route back through
+    // `preflightAndExecute`, which checks above; `startMission` reaches
+    // this point with a fresh mission ID and an empty cancelIntents entry.
+    cancelIntents.current.delete(missionId)
+
     // Send to agent
     ensureConnection().then(() => {
       const requestId = `claude-${Date.now()}`
@@ -1296,8 +1846,9 @@ Install the console locally with the KubeStellar Console agent to use AI mission
         m.id === missionId ? { ...m, status: 'running', currentStep: 'Connecting to agent...' } : m
       ))
 
-      // Track token usage for this mission
-      setActiveTokenCategory('missions')
+      // Track token usage for this specific mission (#6016 — keyed by
+      // missionId so concurrent missions get independent attribution).
+      setActiveTokenCategory(missionId, 'missions')
 
       wsSend(JSON.stringify({
         id: requestId,
@@ -1426,11 +1977,20 @@ Install the console locally with the KubeStellar Console agent to use AI mission
       ))
 
       executeMission(missionId, prompt, { context: mission.context, type: mission.type })
-    }).catch(() => {
-      // Preflight threw unexpectedly — allow mission to proceed
-      const lastUserMsg = mission.messages.find(m => m.role === 'user')
-      const prompt = lastUserMsg?.content || mission.description
-      executeMission(missionId, prompt, { context: mission.context, type: mission.type })
+    }).catch((err) => {
+      // Preflight threw unexpectedly — re-block instead of fail-open (#5851)
+      setMissions(prev => prev.map(m =>
+        m.id === missionId ? {
+          ...m,
+          status: 'blocked' as MissionStatus,
+          currentStep: 'Preflight check error',
+          preflightError: {
+            code: 'UNKNOWN_EXECUTION_FAILURE',
+            message: err instanceof Error ? err.message : 'Unknown error',
+            details: { hint: 'The preflight check threw an unexpected error. Retry or check cluster connectivity.' },
+          },
+        } : m
+      ))
     })
   }
 
@@ -1548,12 +2108,49 @@ Install the console locally with the KubeStellar Console agent to use AI mission
     // Guard against double-cancel: if already cancelling, don't schedule another timeout
     if (cancelTimeouts.current.has(missionId)) return
 
-    // Immediately purge ALL pending request IDs for this mission so that late
-    // responses (from earlier failed or in-flight requests) are dropped before
-    // finalizeCancellation runs (#4499).
-    for (const [reqId, mId] of pendingRequests.current.entries()) {
-      if (mId === missionId) pendingRequests.current.delete(reqId)
+    // #6370 — Mark the cancel intent synchronously BEFORE any state update or
+    // backend call. This is the authoritative signal for the message handler:
+    // any terminal message arriving after this point will be routed through
+    // `finalizeCancellation` instead of transitioning to 'completed'.
+    cancelIntents.current.add(missionId)
+
+    // Pending missions have never been sent to the backend yet (preflight
+    // check is still running, or ensureConnection has not resolved). We can
+    // short-circuit here and finalize the mission as cancelled without
+    // contacting the backend at all (#5932). This also applies to the
+    // 'blocked' state where the mission is waiting on preflight resolution.
+    const currentMission = missionsRef.current.find(m => m.id === missionId)
+    if (currentMission && (currentMission.status === 'pending' || currentMission.status === 'blocked')) {
+      // Clean up any tracking just in case
+      for (const [reqId, mId] of pendingRequests.current.entries()) {
+        if (mId === missionId) pendingRequests.current.delete(reqId)
+      }
+      lastStreamTimestamp.current.delete(missionId)
+
+      setMissions(prev => prev.map(m =>
+        m.id === missionId ? {
+          ...m,
+          status: 'failed' as MissionStatus,
+          currentStep: undefined,
+          updatedAt: new Date(),
+          messages: [
+            ...m.messages,
+            {
+              id: `msg-cancel-pending-${Date.now()}`,
+              role: 'system' as const,
+              content: 'Mission cancelled by user before it started.',
+              timestamp: new Date() }
+          ]
+        } : m
+      ))
+      return
     }
+
+    // Keep pendingRequests intact so that terminal messages (result, stream-done)
+    // from the backend can still be matched to the mission. The handler for
+    // 'cancelling' missions (below) treats any terminal message as implicit
+    // cancel confirmation, so clearing these prematurely caused the mission to
+    // stay in 'cancelling' until the client-side timeout (#5476).
     lastStreamTimestamp.current.delete(missionId)
 
     // Try WebSocket first (fastest path when connected)
@@ -1564,12 +2161,24 @@ Install the console locally with the KubeStellar Console agent to use AI mission
         payload: { sessionId: missionId } }))
     } else {
       // HTTP fallback — WS may be disconnected during long agent runs.
-      // Use the response to determine if cancellation succeeded.
+      // Use the response body to determine if cancellation succeeded (#5477).
       fetch(`${LOCAL_AGENT_HTTP_URL}/cancel-chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: missionId }) }).then(response => {
+        body: JSON.stringify({ sessionId: missionId }) }).then(async response => {
         if (response.ok) {
+          // Check the `cancelled` flag in the response body — HTTP 200 alone
+          // does not guarantee the session was actually cancelled (e.g. if the
+          // session was already finished or the ID was invalid).
+          try {
+            const body = await response.json() as { cancelled?: boolean; message?: string }
+            if (body.cancelled === false) {
+              finalizeCancellation(missionId, body.message || 'Mission cancellation failed — backend indicated the session was not cancelled.')
+              return
+            }
+          } catch {
+            // Body parsing failed — treat HTTP 200 as success (best effort)
+          }
           finalizeCancellation(missionId, 'Mission cancelled by user.')
         } else {
           finalizeCancellation(missionId, 'Mission cancellation failed — backend returned an error. The mission may still be running.')
@@ -1621,8 +2230,25 @@ Install the console locally with the KubeStellar Console agent to use AI mission
       return
     }
 
-    // Track token usage for this mission
-    setActiveTokenCategory('missions')
+    // Prevent sending while mission is already running or cancelling (#5478).
+    // Only stop commands (handled above) are allowed during active execution.
+    const currentMission = missionsRef.current.find(m => m.id === missionId)
+    if (currentMission && (currentMission.status === 'running' || currentMission.status === 'cancelling')) {
+      return
+    }
+    // Blocked missions are waiting on preflight resolution (missing
+    // credentials, RBAC failures, etc.). New input must not bypass that
+    // validation — the user has to call retryPreflight after fixing the
+    // underlying issue, which will move the mission to 'running' first
+    // (#5934). Silently dropping the send here is safe because the UI
+    // already disables the input in the blocked state.
+    if (currentMission && currentMission.status === 'blocked') {
+      return
+    }
+
+    // Track token usage for this specific mission (#6016 — keyed by
+    // missionId so concurrent missions get independent attribution).
+    setActiveTokenCategory(missionId, 'missions')
 
     setMissions(prev => prev.map(m => {
       if (m.id !== missionId) return m
@@ -1698,6 +2324,18 @@ Install the console locally with the KubeStellar Console agent to use AI mission
 
   // Dismiss/remove a mission from the list
   const dismissMission = (missionId: string) => {
+    // Cancel backend execution before removing from UI to prevent
+    // invisible continued operations after dismiss (#5816)
+    cancelMission(missionId)
+    // Clean up pending requests to prevent WS events from triggering
+    // setMissions re-renders for a mission that no longer exists (#5835)
+    for (const [reqId, mId] of pendingRequests.current.entries()) {
+      if (mId === missionId) pendingRequests.current.delete(reqId)
+    }
+    lastStreamTimestamp.current.delete(missionId)
+    // #6410 — mission is being removed from UI; drop per-mission tracking.
+    streamSplitCounter.current.delete(missionId)
+    toolsInFlight.current.delete(missionId)
     setMissions(prev => prev.filter(m => m.id !== missionId))
     if (activeMissionId === missionId) {
       setActiveMissionId(null)
@@ -1832,6 +2470,12 @@ Install the console locally with the KubeStellar Console agent to use AI mission
   // and clear any pending cancel acknowledgment timeouts
   useEffect(() => {
     const cancelTimeoutsRef = cancelTimeouts.current
+    const cancelIntentsRef = cancelIntents.current
+    const pendingRequestsRef = pendingRequests.current
+    const toolsInFlightRef = toolsInFlight.current
+    const lastStreamTimestampRef = lastStreamTimestamp.current
+    const streamSplitCounterRef = streamSplitCounter.current
+    const waitingInputTimeoutsRef = waitingInputTimeouts.current
     return () => {
       if (wsReconnectTimer.current) {
         clearTimeout(wsReconnectTimer.current)
@@ -1842,7 +2486,35 @@ Install the console locally with the KubeStellar Console agent to use AI mission
         clearTimeout(timeout)
       }
       cancelTimeoutsRef.clear()
-      wsRef.current?.close()
+      // Clear any lingering cancel intents (#6370)
+      cancelIntentsRef.clear()
+      // #6377 — drop pendingRequests so closures over the handler don't
+      // pin mission IDs after the provider unmounts. Without this, mounting
+      // and unmounting the provider in tests or Storybook leaks a growing
+      // Map keyed by stale request IDs.
+      pendingRequestsRef.clear()
+      toolsInFlightRef.clear()
+      lastStreamTimestampRef.clear()
+      streamSplitCounterRef.clear()
+      // Clear waiting_input watchdogs so they don't fire after unmount
+      for (const t of waitingInputTimeoutsRef.values()) {
+        clearTimeout(t)
+      }
+      waitingInputTimeoutsRef.clear()
+      // #6410 — nullify handlers BEFORE close(). `onclose` is what schedules
+      // reconnection (see `wsReconnectTimer.current = setTimeout(...)` in
+      // ensureConnection); if we don't detach it, an unmounted provider can
+      // still enqueue reconnect attempts after tear-down. Detach the other
+      // handlers too so late events from the dying socket can't touch state
+      // on an unmounted component.
+      const dyingWs = wsRef.current
+      if (dyingWs) {
+        dyingWs.onopen = null
+        dyingWs.onmessage = null
+        dyingWs.onerror = null
+        dyingWs.onclose = null
+        dyingWs.close()
+      }
     }
   }, [])
 

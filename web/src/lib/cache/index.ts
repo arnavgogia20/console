@@ -24,6 +24,7 @@
  */
 
 import { useEffect, useCallback, useRef, useSyncExternalStore } from 'react'
+import { useKeepAliveActive } from '../../hooks/useKeepAliveActive'
 import { isDemoMode, subscribeDemoMode } from '../demoMode'
 import { registerCacheReset, registerRefetch } from '../modeTransition'
 import { STORAGE_KEY_KUBECTL_HISTORY } from '../constants'
@@ -1096,6 +1097,10 @@ export function useCache<T>({
     subscribeAutoRefreshPaused, isAutoRefreshPaused, isAutoRefreshPaused
   )
 
+  // Pause polling when this component is on an inactive KeepAlive route (#5856).
+  // Hidden routes should not fetch or trigger state updates that block rendering.
+  const keepAliveActive = useKeepAliveActive()
+
   // Effective enabled: both the passed prop AND not in demo mode
   // liveInDemoMode bypasses the demo check for cards backed by serverless functions
   const effectiveEnabled = enabled && (!demoMode || liveInDemoMode)
@@ -1155,9 +1160,9 @@ export function useCache<T>({
   progressiveFetcherRef.current = progressiveFetcher
 
   const refetch = useCallback(async () => {
-    if (!effectiveEnabled) return
+    if (!effectiveEnabled || !keepAliveActive) return
     await store.fetch(() => fetcherRef.current(), mergeRef.current, progressiveFetcherRef.current)
-  }, [effectiveEnabled, store])
+  }, [effectiveEnabled, keepAliveActive, store])
 
   const clearAndRefetch = async () => {
     await store.clear()
@@ -1191,8 +1196,9 @@ export function useCache<T>({
 
     // Only fetch immediately on initial mount or page navigation, NOT when
     // the effect re-fires due to consecutiveFailures/backoff interval changes.
-    if (!isModeTransition && !initialFetchDoneRef.current) {
-      // Initial mount or page navigation remount — fetch immediately
+    if (!isModeTransition && !initialFetchDoneRef.current && keepAliveActive) {
+      // Initial mount or page navigation remount — fetch immediately.
+      // Only mark done when we actually started a fetch (#5891).
       initialFetchDoneRef.current = true
       refetch().catch(() => { /* errors handled inside CacheStore.fetch */ })
     }
@@ -1204,7 +1210,9 @@ export function useCache<T>({
 
     // Auto-refresh interval — uses a ref-tracked timer to prevent thrashing.
     // Only create a new timer if none is already pending (#5252).
-    if (autoRefresh && !autoRefreshGloballyPaused) {
+    // Pause when the route is inactive in KeepAlive to stop hidden dashboards
+    // from polling and blocking the active route (#5856).
+    if (autoRefresh && !autoRefreshGloballyPaused && keepAliveActive) {
       if (!autoRefreshTimerRef.current) {
         autoRefreshTimerRef.current = setInterval(() => {
           refetch().catch(() => { /* errors handled inside CacheStore.fetch */ })
@@ -1218,18 +1226,18 @@ export function useCache<T>({
     return () => {
       unregisterRefetch()
     }
-  }, [effectiveEnabled, autoRefresh, autoRefreshGloballyPaused, refetch, store, key])
+  }, [effectiveEnabled, autoRefresh, autoRefreshGloballyPaused, keepAliveActive, refetch, store, key])
 
   // Restart the auto-refresh timer when the backoff interval changes.
   // Separated from the main effect to avoid re-running mount/mode-transition logic (#5252).
   useEffect(() => {
-    if (!autoRefreshTimerRef.current || !autoRefresh || autoRefreshGloballyPaused) return
+    if (!autoRefreshTimerRef.current || !autoRefresh || autoRefreshGloballyPaused || !keepAliveActive) return
     // Clear old timer and create a new one with updated interval
     clearInterval(autoRefreshTimerRef.current)
     autoRefreshTimerRef.current = setInterval(() => {
       refetch().catch(() => { /* errors handled inside CacheStore.fetch */ })
     }, effectiveInterval)
-  }, [effectiveInterval, autoRefresh, autoRefreshGloballyPaused, refetch])
+  }, [effectiveInterval, autoRefresh, autoRefreshGloballyPaused, keepAliveActive, refetch])
 
   // Clean up auto-refresh timer on unmount
   useEffect(() => {
@@ -1257,8 +1265,27 @@ export function useCache<T>({
   // Combined with useLayoutEffect state reports this caused React error #185
   // (Maximum update depth exceeded).  Capturing via ref keeps the identity
   // stable across renders while still picking up the first provided value.
+  //
+  // Update the refs when the caller provides meaningfully different data (#5425).
+  // JSON.stringify comparison is used to detect structural changes without
+  // triggering on every render when the caller creates new-but-equal objects.
   const demoDataRef = useRef(demoData)
   const initialDataRef = useRef(initialData)
+
+  const demoDataJSON = JSON.stringify(demoData)
+  const initialDataJSON = JSON.stringify(initialData)
+  const prevDemoJSON = useRef(demoDataJSON)
+  const prevInitialJSON = useRef(initialDataJSON)
+
+  if (demoDataJSON !== prevDemoJSON.current) {
+    prevDemoJSON.current = demoDataJSON
+    demoDataRef.current = demoData
+  }
+  if (initialDataJSON !== prevInitialJSON.current) {
+    prevInitialJSON.current = initialDataJSON
+    initialDataRef.current = initialData
+  }
+
   const stableDemoData = demoDataRef.current
   const stableInitialData = initialDataRef.current
 

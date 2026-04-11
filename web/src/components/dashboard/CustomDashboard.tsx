@@ -28,6 +28,7 @@ import { useSidebarConfig } from '../../hooks/useSidebarConfig'
 import { useToast } from '../ui/Toast'
 import { CardWrapper } from '../cards/CardWrapper'
 import { CARD_COMPONENTS } from '../cards/cardRegistry'
+import { useCardCollapse } from '../../lib/cards/cardHooks'
 import { safeGetJSON, safeSetJSON, safeRemoveItem } from '../../lib/utils/localStorage'
 import { ROUTES } from '../../config/routes'
 import { AddCardModal } from './AddCardModal'
@@ -42,6 +43,7 @@ import { BaseModal } from '../../lib/modals'
 import { useModalState } from '../../lib/modals'
 import { formatCardTitle } from '../../lib/formatCardTitle'
 import { StatsOverview, StatBlockValue } from '../ui/StatsOverview'
+import { getClusterHealthState, isClusterUnreachable } from '../clusters/utils'
 import { useUniversalStats, createMergedStatValueGetter } from '../../hooks/useUniversalStats'
 import { useRefreshIndicator } from '../../hooks/useRefreshIndicator'
 import { DashboardHeader } from '../shared/DashboardHeader'
@@ -63,6 +65,15 @@ const NARROW_MAX = 1023
 
 /** Minimum card column span at narrow viewports */
 const MIN_NARROW_COLS = 6
+
+/**
+ * Minimum pixel height a non-collapsed sortable card cell should occupy.
+ * Mirrors the legacy `auto-rows-[minmax(180px,auto)]` baseline so expanded
+ * cards keep their previous look now that the grid container uses
+ * `auto-rows-min` (which is required so collapsed cards can shrink and let
+ * neighbours pack upward — see issue #6072).
+ */
+const EXPANDED_CARD_MIN_HEIGHT_PX = 180
 
 // Sortable card component
 interface SortableCardProps {
@@ -93,17 +104,24 @@ function SortableCard({ card, onConfigure, onRemove, onWidthChange, isDragging, 
   useEffect(() => {
     const mq = window.matchMedia(`(min-width: ${NARROW_MIN}px) and (max-width: ${NARROW_MAX}px)`)
     const handler = (e: MediaQueryListEvent) => setIsNarrowRange(e.matches)
-    setIsNarrowRange(mq.matches)
+    if (mq.matches !== isNarrowRange) setIsNarrowRange(mq.matches)
     mq.addEventListener('change', handler)
     return () => mq.removeEventListener('change', handler)
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const effectiveW = isNarrowRange && (card.position?.w || 4) < MIN_NARROW_COLS ? MIN_NARROW_COLS : (card.position?.w || 4)
+
+  // Read collapse state so the cell can drop its minimum height when the
+  // card is collapsed (#6072). Without this, the grid leaves dead space
+  // under collapsed cards because every cell is forced to the expanded
+  // baseline height.
+  const { isCollapsed } = useCardCollapse(card.id)
 
   const style = {
     transform: CSS.Transform.toString(transform),
     transition,
     gridColumn: `span ${effectiveW}`,
+    minHeight: isCollapsed ? undefined : `${EXPANDED_CARD_MIN_HEIGHT_PX}px`,
     opacity: isDragging ? 0.5 : 1 }
 
   const CardComponent = CARD_COMPONENTS[card.card_type]
@@ -214,9 +232,10 @@ export function CustomDashboard() {
   const sidebarItem = [...config.primaryNav, ...config.secondaryNav]
       .find(item => item.href === `/custom-dashboard/${id}`)
 
-  // Stats data from clusters
-  const healthyClusters = deduplicatedClusters.filter((c) => c.healthy === true && c.reachable !== false).length
-  const unhealthyClusters = deduplicatedClusters.filter((c) => c.healthy === false && c.reachable !== false).length
+  // Stats data from clusters — use the centralised state machine so these
+  // counts always match the main cluster grid and sidebar (#5928).
+  const healthyClusters = deduplicatedClusters.filter((c) => !isClusterUnreachable(c) && getClusterHealthState(c) === 'healthy').length
+  const unhealthyClusters = deduplicatedClusters.filter((c) => !isClusterUnreachable(c) && getClusterHealthState(c) === 'unhealthy').length
   const totalNodes = deduplicatedClusters.reduce((sum, c) => sum + (c.nodeCount || 0), 0)
   const totalPods = deduplicatedClusters.reduce((sum, c) => sum + (c.podCount || 0), 0)
 
@@ -642,7 +661,7 @@ export function CustomDashboard() {
           onDragEnd={handleDragEnd}
         >
           <SortableContext items={cards.map(c => c.id)} strategy={rectSortingStrategy}>
-            <div className="grid grid-cols-1 md:grid-cols-12 gap-2 auto-rows-[minmax(180px,auto)]">
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-2 auto-rows-min grid-flow-dense">
               {cards.map((card, index) => (
                 <SortableCard
                   key={card.id}

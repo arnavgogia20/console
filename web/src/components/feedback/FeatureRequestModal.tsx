@@ -20,6 +20,7 @@ import { FEEDBACK_UPLOAD_TIMEOUT_MS } from '../../lib/constants/network'
 import { GITHUB_TOKEN_CREATE_URL, GITHUB_TOKEN_FINE_GRAINED_PERMISSIONS } from '../../lib/constants/github-token'
 import { compressScreenshot } from '../../lib/imageCompression'
 import { emitLinkedInShare } from '../../lib/analytics'
+import { copyBlobToClipboard } from '../../lib/clipboard'
 import { isDemoModeForced } from '../../lib/demoMode'
 import { useToast } from '../ui/Toast'
 import { useTranslation } from 'react-i18next'
@@ -206,7 +207,14 @@ export function FeatureRequestModal({ isOpen, onClose, initialTab, initialReques
     try {
       const res = await fetch(preview, { signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
       const blob = await res.blob()
-      await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })])
+      // #6229: shared clipboard helper guards `navigator.clipboard.write`
+      // AND `typeof ClipboardItem === 'function'`. See FeedbackModal for
+      // the same change.
+      const ok = await copyBlobToClipboard(blob)
+      if (!ok) {
+        showToast('Could not copy image to clipboard (browser may not support image copy)', 'error')
+        return
+      }
       setCopiedIndex(index)
       setTimeout(() => setCopiedIndex(null), COPY_FEEDBACK_TIMEOUT_MS)
     } catch {
@@ -316,13 +324,21 @@ export function FeatureRequestModal({ isOpen, onClose, initialTab, initialReques
     }
   }
 
-  /** Save current form content as a draft (new or update existing) */
+  /** Save current form content as a draft (new or update existing).
+   * Screenshots are persisted as base64 data URIs (the preview field
+   * produced by FileReader.readAsDataURL) so they survive a full
+   * reload. The File object itself cannot be serialized. #6102
+   */
   const handleSaveDraft = () => {
     if (description.trim().length < 5) {
       showToast('Draft is too short to save', 'error')
       return
     }
-    const id = saveDraft({ requestType, targetRepo, description }, editingDraftId || undefined)
+    const screenshotDataURIs = screenshots.map(s => s.preview)
+    const id = saveDraft(
+      { requestType, targetRepo, description, screenshots: screenshotDataURIs },
+      editingDraftId || undefined,
+    )
     if (id) {
       setEditingDraftId(id)
       showToast(editingDraftId ? 'Draft updated' : 'Draft saved', 'success')
@@ -335,6 +351,14 @@ export function FeatureRequestModal({ isOpen, onClose, initialTab, initialReques
     setTargetRepo(draft.targetRepo)
     setDescription(draft.description)
     setEditingDraftId(draft.id)
+    // Restore screenshots from the draft. We recreate a minimal File
+    // stub (the upload pipeline only needs `preview`; the `file` field
+    // is used for displaying size/name in the uploader UI). #6102
+    const restoredScreenshots = (draft.screenshots || []).map((preview, idx) => ({
+      file: new File([], `draft-screenshot-${idx + 1}.png`, { type: 'image/png' }),
+      preview,
+    }))
+    setScreenshots(restoredScreenshots)
     setActiveTab('submit')
     showToast('Draft loaded into editor', 'success')
   }
@@ -459,7 +483,7 @@ export function FeatureRequestModal({ isOpen, onClose, initialTab, initialReques
     <BaseModal isOpen={isOpen} onClose={handleClose} size="lg" closeOnBackdrop={false} closeOnEscape={true} className="!h-[80vh]">
       {/* Discard/Save Draft confirmation — 3-way choice: Save Draft, Discard, Keep Editing */}
       {showDiscardConfirm && (
-        <div className="fixed inset-0 z-[10002] flex items-center justify-center bg-black/60 backdrop-blur-sm" role="presentation">
+        <div className="fixed inset-0 z-critical flex items-center justify-center bg-black/60 backdrop-blur-sm" role="presentation">
           <div className="bg-background border border-border rounded-lg shadow-xl p-6 max-w-sm w-full mx-4" role="dialog" aria-modal="true" onClick={e => e.stopPropagation()}>
             <div className="flex items-center gap-3 mb-3">
               <div className="w-10 h-10 rounded-full bg-yellow-500/20 flex items-center justify-center flex-shrink-0">
@@ -502,10 +526,10 @@ export function FeatureRequestModal({ isOpen, onClose, initialTab, initialReques
       {showLoginPrompt && (
         <>
           <div
-            className="fixed inset-0 bg-black/60 backdrop-blur-2xl z-[10001]"
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-critical"
             onClick={() => setShowLoginPrompt(false)}
           />
-          <div className="fixed inset-0 z-[10001] flex items-center justify-center p-4 pointer-events-none">
+          <div className="fixed inset-0 z-critical flex items-center justify-center p-4 pointer-events-none">
             {isDemoModeForced ? (
               /* Demo mode: simple prompt to get their own console */
               <div
@@ -1916,7 +1940,7 @@ export function FeatureRequestModal({ isOpen, onClose, initialTab, initialReques
       {isPreviewFullscreen && (
         <div
           ref={fullscreenOverlayRef}
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 backdrop-blur-sm"
+          className="fixed inset-0 z-overlay flex items-center justify-center bg-black/60 backdrop-blur-sm"
           onClick={(e) => {
             if (e.target === fullscreenOverlayRef.current) {
               setIsPreviewFullscreen(false)
@@ -1954,7 +1978,7 @@ export function FeatureRequestModal({ isOpen, onClose, initialTab, initialReques
       {previewImageSrc && (
         <div
           ref={screenshotPreviewRef}
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 backdrop-blur-sm"
+          className="fixed inset-0 z-overlay flex items-center justify-center bg-black/60 backdrop-blur-sm"
           onClick={(e) => {
             if (e.target === screenshotPreviewRef.current) {
               setPreviewImageSrc(null)

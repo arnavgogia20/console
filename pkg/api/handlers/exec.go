@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gofiber/contrib/websocket"
+	"github.com/google/uuid"
 	"github.com/kubestellar/console/pkg/api/middleware"
 	"github.com/kubestellar/console/pkg/k8s"
 	corev1 "k8s.io/api/core/v1"
@@ -23,6 +24,91 @@ const execAuthDeadline = 5 * time.Second
 // execMaxStdinBytes is the maximum allowed size of a single stdin message.
 // Messages exceeding this limit are silently dropped to prevent memory exhaustion.
 const execMaxStdinBytes = 1 * 1024 * 1024 // 1 MB
+
+// execSessionRegistry tracks active exec sessions per user so that
+// CancelUserExecSessions can tear them down on logout (#6024).
+//
+// The /ws/exec handler does not register with the WebSocket Hub (it runs its
+// own read loop and does not exchange JSON frames with the hub), so the
+// Hub.DisconnectUser path used by Logout cannot see exec sessions. This
+// registry bridges that gap: when a new exec session's stream context is
+// created, the cancel function is recorded here keyed by userID. On logout,
+// CancelUserExecSessions runs every recorded cancel for that user, which
+// unblocks executor.StreamWithContext and causes the WebSocket handler to
+// exit its goroutines and close the connection.
+//
+// A regular sync.Mutex is used (not RWMutex) because writes (add/remove on
+// session start/end) and reads (CancelUserExecSessions on logout) are both
+// infrequent and always short; an RWMutex would add complexity for no gain.
+var (
+	execSessionsMu sync.Mutex
+	execSessions   = make(map[uuid.UUID]map[int64]context.CancelFunc)
+	execSessionSeq int64 // monotonic id generator, guarded by execSessionsMu
+)
+
+// registerExecSession records cancel under userID and returns the assigned
+// session id. The session id is used by unregisterExecSession to remove the
+// specific entry when the session ends normally, so the map does not grow
+// unbounded across many sessions by the same user.
+func registerExecSession(userID uuid.UUID, cancel context.CancelFunc) int64 {
+	execSessionsMu.Lock()
+	defer execSessionsMu.Unlock()
+	execSessionSeq++
+	id := execSessionSeq
+	sessions, ok := execSessions[userID]
+	if !ok {
+		sessions = make(map[int64]context.CancelFunc)
+		execSessions[userID] = sessions
+	}
+	sessions[id] = cancel
+	return id
+}
+
+// unregisterExecSession removes a single session entry. Called from the exec
+// handler's deferred cleanup on normal session end so the registry stays
+// bounded by the number of concurrently live exec sessions, not the total
+// lifetime count.
+func unregisterExecSession(userID uuid.UUID, id int64) {
+	execSessionsMu.Lock()
+	defer execSessionsMu.Unlock()
+	sessions, ok := execSessions[userID]
+	if !ok {
+		return
+	}
+	delete(sessions, id)
+	if len(sessions) == 0 {
+		delete(execSessions, userID)
+	}
+}
+
+// CancelUserExecSessions cancels every active exec session belonging to the
+// given user and clears the entries from the registry. Called from the auth
+// Logout handler after revoking the JWT so that any pod shell the user had
+// open stops accepting input and unblocks the StreamWithContext goroutine
+// (#6024). Safe to call with a userID that has no live sessions.
+func CancelUserExecSessions(userID uuid.UUID) {
+	execSessionsMu.Lock()
+	sessions, ok := execSessions[userID]
+	if !ok {
+		execSessionsMu.Unlock()
+		return
+	}
+	// Take ownership of the cancel funcs under the lock, then release the
+	// lock before invoking them. Calling cancel() itself is cheap but the
+	// goroutines it unblocks may contend for other locks; holding
+	// execSessionsMu across those is unnecessary and risks deadlock.
+	cancels := make([]context.CancelFunc, 0, len(sessions))
+	for _, c := range sessions {
+		cancels = append(cancels, c)
+	}
+	delete(execSessions, userID)
+	execSessionsMu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	slog.Info("[Exec] cancelled exec sessions for user", "user", userID, "count", len(cancels))
+}
 
 // ExecHandlers handles pod exec API endpoints
 type ExecHandlers struct {
@@ -171,10 +257,37 @@ func (h *ExecHandlers) HandleExec(c *websocket.Conn) {
 		return
 	}
 
-	slog.Info("[Exec] authenticated user for pod exec", "user", claims.GitHubLogin)
+	// SECURITY WARNING (#5406): This handler validates authentication (JWT) but
+	// does NOT perform authorization. Any authenticated user can open a shell to
+	// any pod in any cluster. Full RBAC scoping requires checking the user's
+	// Kubernetes RBAC permissions (SubjectAccessReview with "create" verb on
+	// "pods/exec" in the target namespace/cluster) before establishing the exec
+	// session. This is a known limitation tracked in issue #5406.
+	slog.Warn("[Exec] SECURITY: pod exec session opened — no authorization check performed",
+		"user", claims.GitHubLogin,
+		"user_id", claims.UserID,
+		"remote_addr", c.RemoteAddr().String(),
+	)
 
 	// Clear read deadline after successful auth
 	c.SetReadDeadline(time.Time{})
+
+	// Create the cancellable context and register it BEFORE any of the long-
+	// running setup (init message read, k8s client lookup, executor build).
+	// Without this, there is a race window: the user authenticates, then
+	// logs out before the registration call below, and CancelUserExecSessions
+	// has nothing to cancel — the about-to-start exec session leaks past
+	// logout. Registering up-front shrinks the window to roughly zero
+	// because the context is already in the per-user registry when the
+	// long-running operations begin (#6075).
+	execCtx, execCancel := context.WithCancel(context.Background())
+	defer execCancel()
+
+	var execRegistrationID int64
+	if claims.UserID != uuid.Nil {
+		execRegistrationID = registerExecSession(claims.UserID, execCancel)
+		defer unregisterExecSession(claims.UserID, execRegistrationID)
+	}
 
 	if h.k8sClient == nil {
 		writeError(c, "No Kubernetes client available")
@@ -203,6 +316,17 @@ func (h *ExecHandlers) HandleExec(c *websocket.Conn) {
 		writeError(c, "Missing cluster, namespace, or pod")
 		return
 	}
+
+	// SECURITY: Log exec target details for audit trail (#5406)
+	slog.Warn("[Exec] SECURITY: exec session targeting pod",
+		"user", claims.GitHubLogin,
+		"user_id", claims.UserID,
+		"cluster", init.Cluster,
+		"namespace", init.Namespace,
+		"pod", init.Pod,
+		"container", init.Container,
+		"command", init.Command,
+	)
 
 	// Default command
 	if len(init.Command) == 0 {
@@ -274,10 +398,9 @@ func (h *ExecHandlers) HandleExec(c *websocket.Conn) {
 	// Send initial terminal size
 	sizeQueue.ch <- remotecommand.TerminalSize{Width: init.Cols, Height: init.Rows}
 
-	// Create a cancellable context so that when the WebSocket client disconnects,
-	// the exec stream is cancelled promptly — preventing goroutine and SPDY leaks.
-	execCtx, execCancel := context.WithCancel(context.Background())
-	defer execCancel()
+	// execCtx / execCancel were created up-front (right after JWT validation)
+	// so the registry is populated before any long-running setup. See the
+	// comment above for the race-window rationale (#6075).
 
 	// Start a goroutine to read WebSocket messages and route them
 	done := make(chan struct{})

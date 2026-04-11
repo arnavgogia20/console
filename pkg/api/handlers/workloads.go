@@ -16,6 +16,7 @@ import (
 	"github.com/kubestellar/console/pkg/agent"
 	"github.com/kubestellar/console/pkg/api/middleware"
 	"github.com/kubestellar/console/pkg/k8s"
+	"github.com/kubestellar/console/pkg/models"
 	"github.com/kubestellar/console/pkg/store"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -49,6 +50,23 @@ func NewWorkloadHandlers(k8sClient *k8s.MultiClusterClient, hub *Hub, s store.St
 		hub:       hub,
 		store:     s,
 	}
+}
+
+// requireAdmin enforces the console-admin role on mutating workload endpoints
+// (#5974). All modify endpoints — deploy, scale, delete, cluster-group CRUD —
+// go through this single helper so the check can never drift between
+// handlers. When no user store is configured (dev/demo/tests) the check is
+// skipped; production wiring always passes a real store in.
+func (h *WorkloadHandlers) requireAdmin(c *fiber.Ctx) error {
+	if h.store == nil {
+		return nil
+	}
+	currentUserID := middleware.GetUserID(c)
+	currentUser, err := h.store.GetUser(currentUserID)
+	if err != nil || currentUser == nil || currentUser.Role != models.UserRoleAdmin {
+		return fiber.NewError(fiber.StatusForbidden, "Console admin access required")
+	}
+	return nil
 }
 
 // ListWorkloads returns all workloads across clusters
@@ -103,11 +121,9 @@ func (h *WorkloadHandlers) GetWorkload(c *fiber.Ctx) error {
 // DeployWorkload deploys a workload to specified clusters
 // POST /api/workloads/deploy
 func (h *WorkloadHandlers) DeployWorkload(c *fiber.Ctx) error {
-	// Require console admin role for workload mutations
-	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
-	if err != nil || currentUser == nil || currentUser.Role != "admin" {
-		return fiber.NewError(fiber.StatusForbidden, "Console admin access required")
+	// Workload mutations require console admin (#5974).
+	if err := h.requireAdmin(c); err != nil {
+		return err
 	}
 
 	if h.k8sClient == nil {
@@ -136,8 +152,32 @@ func (h *WorkloadHandlers) DeployWorkload(c *fiber.Ctx) error {
 	if req.Namespace == "" {
 		return c.Status(400).JSON(fiber.Map{"error": "namespace is required"})
 	}
+	if req.SourceCluster == "" {
+		// #5957 — reject missing sourceCluster with a clear 400 rather than
+		// letting it fall through and surface as a confusing downstream error.
+		return c.Status(400).JSON(fiber.Map{"error": "sourceCluster is required"})
+	}
+	if err := validateK8sName(req.SourceCluster, "sourceCluster"); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+	}
 	if len(req.TargetClusters) == 0 {
 		return c.Status(400).JSON(fiber.Map{"error": "at least one targetCluster is required"})
+	}
+	// Verify sourceCluster is actually known to the multi-cluster client (#5957).
+	// Catches typos and stale UI state before we attempt to read from the source.
+	if h.k8sClient != nil {
+		known := false
+		if clusters, _, cerr := h.k8sClient.HealthyClusters(c.Context()); cerr == nil {
+			for _, cl := range clusters {
+				if cl.Name == req.SourceCluster || cl.Context == req.SourceCluster {
+					known = true
+					break
+				}
+			}
+		}
+		if !known {
+			return c.Status(400).JSON(fiber.Map{"error": fmt.Sprintf("sourceCluster %q is not a known cluster", req.SourceCluster)})
+		}
 	}
 
 	// Extract authenticated user
@@ -265,25 +305,35 @@ func (h *WorkloadHandlers) GetDeployStatus(c *fiber.Ctx) error {
 	}
 
 	if workload == nil {
+		// #5958 — The status field was previously "not_found" (snake_case) which
+		// the frontend's DeployMissions poll loop did not recognise, leaving the
+		// mission stuck in a "pending" state for many poll cycles. Return a
+		// stable shape that the frontend checks for explicitly.
 		return c.JSON(fiber.Map{
 			"cluster":       cluster,
 			"namespace":     namespace,
 			"name":          name,
-			"status":        "not_found",
+			"status":        "NotFound",
+			"notFound":      true,
 			"replicas":      0,
 			"readyReplicas": 0,
+			"reason":        "WorkloadDeleted",
+			"message":       "workload no longer exists on target cluster",
 		})
 	}
 
 	return c.JSON(fiber.Map{
-		"cluster":       cluster,
-		"namespace":     namespace,
-		"name":          name,
-		"status":        workload.Status,
-		"replicas":      workload.Replicas,
-		"readyReplicas": workload.ReadyReplicas,
-		"type":          workload.Type,
-		"image":         workload.Image,
+		"cluster":         cluster,
+		"namespace":       namespace,
+		"name":            name,
+		"status":          workload.Status,
+		"replicas":        workload.Replicas,
+		"readyReplicas":   workload.ReadyReplicas,
+		"updatedReplicas": workload.UpdatedReplicas,
+		"reason":          workload.Reason,
+		"message":         workload.Message,
+		"type":            workload.Type,
+		"image":           workload.Image,
 	})
 }
 
@@ -363,11 +413,9 @@ func (h *WorkloadHandlers) ListClusterGroups(c *fiber.Ctx) error {
 // CreateClusterGroup creates a new cluster group and labels the member clusters
 // POST /api/cluster-groups
 func (h *WorkloadHandlers) CreateClusterGroup(c *fiber.Ctx) error {
-	// Require console admin role for cluster group mutations
-	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
-	if err != nil || currentUser == nil || currentUser.Role != "admin" {
-		return fiber.NewError(fiber.StatusForbidden, "Console admin access required")
+	// Cluster group mutations require console admin (#5974).
+	if err := h.requireAdmin(c); err != nil {
+		return err
 	}
 
 	var group ClusterGroup
@@ -418,11 +466,9 @@ func (h *WorkloadHandlers) CreateClusterGroup(c *fiber.Ctx) error {
 // UpdateClusterGroup updates a cluster group
 // PUT /api/cluster-groups/:name
 func (h *WorkloadHandlers) UpdateClusterGroup(c *fiber.Ctx) error {
-	// Require console admin role for cluster group mutations
-	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
-	if err != nil || currentUser == nil || currentUser.Role != "admin" {
-		return fiber.NewError(fiber.StatusForbidden, "Console admin access required")
+	// Cluster group mutations require console admin (#5974).
+	if err := h.requireAdmin(c); err != nil {
+		return err
 	}
 
 	name := c.Params("name")
@@ -488,11 +534,9 @@ func (h *WorkloadHandlers) UpdateClusterGroup(c *fiber.Ctx) error {
 // DeleteClusterGroup deletes a cluster group and removes labels
 // DELETE /api/cluster-groups/:name
 func (h *WorkloadHandlers) DeleteClusterGroup(c *fiber.Ctx) error {
-	// Require console admin role for cluster group mutations
-	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
-	if err != nil || currentUser == nil || currentUser.Role != "admin" {
-		return fiber.NewError(fiber.StatusForbidden, "Console admin access required")
+	// Cluster group mutations require console admin (#5974).
+	if err := h.requireAdmin(c); err != nil {
+		return err
 	}
 
 	name := c.Params("name")
@@ -532,11 +576,15 @@ func (h *WorkloadHandlers) DeleteClusterGroup(c *fiber.Ctx) error {
 // SyncClusterGroups bulk-syncs cluster groups from frontend localStorage
 // POST /api/cluster-groups/sync
 func (h *WorkloadHandlers) SyncClusterGroups(c *fiber.Ctx) error {
-	// Bulk sync overwrites all cluster groups — require console admin role
-	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
-	if err != nil || currentUser == nil || currentUser.Role != "admin" {
-		return fiber.NewError(fiber.StatusForbidden, "Console admin access required")
+	// Bulk sync overwrites all cluster groups — require console admin (#5974).
+	if err := h.requireAdmin(c); err != nil {
+		return err
+	}
+
+	// Reject oversized payloads (defense-in-depth beyond Fiber's default limit)
+	const syncMaxBodyBytes = 1 << 20 // 1 MB
+	if len(c.Body()) > syncMaxBodyBytes {
+		return fiber.NewError(fiber.StatusRequestEntityTooLarge, "Request body too large")
 	}
 
 	var groups []ClusterGroup
@@ -927,11 +975,9 @@ func buildClusterContextForAI(healthData []k8s.ClusterHealth) string {
 // ScaleWorkload scales a workload in specified clusters
 // POST /api/workloads/scale
 func (h *WorkloadHandlers) ScaleWorkload(c *fiber.Ctx) error {
-	// Require console admin role for workload mutations
-	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
-	if err != nil || currentUser == nil || currentUser.Role != "admin" {
-		return fiber.NewError(fiber.StatusForbidden, "Console admin access required")
+	// Workload mutations require console admin (#5974).
+	if err := h.requireAdmin(c); err != nil {
+		return err
 	}
 
 	if h.k8sClient == nil {
@@ -973,11 +1019,9 @@ func (h *WorkloadHandlers) ScaleWorkload(c *fiber.Ctx) error {
 // DeleteWorkload deletes a workload from specified clusters
 // DELETE /api/workloads/:cluster/:namespace/:name
 func (h *WorkloadHandlers) DeleteWorkload(c *fiber.Ctx) error {
-	// Require console admin role for workload mutations
-	currentUserID := middleware.GetUserID(c)
-	currentUser, err := h.store.GetUser(currentUserID)
-	if err != nil || currentUser == nil || currentUser.Role != "admin" {
-		return fiber.NewError(fiber.StatusForbidden, "Console admin access required")
+	// Workload mutations require console admin (#5974).
+	if err := h.requireAdmin(c); err != nil {
+		return err
 	}
 
 	if h.k8sClient == nil {
@@ -1105,13 +1149,14 @@ func (h *WorkloadHandlers) GetDeployLogs(c *fiber.Ctx) error {
 		}
 	}
 
-	// Sort events by actual timestamp (newest last) (#3718)
+	// Sort events by actual timestamp (newest last) (#3718, #6042).
+	// Prefer modern EventTime; fall back to LastTimestamp then CreationTimestamp.
 	sort.Slice(allEvents, func(i, j int) bool {
-		ti := allEvents[i].LastTimestamp.Time
+		ti := k8s.EffectiveEventTime(&allEvents[i])
 		if ti.IsZero() {
 			ti = allEvents[i].CreationTimestamp.Time
 		}
-		tj := allEvents[j].LastTimestamp.Time
+		tj := k8s.EffectiveEventTime(&allEvents[j])
 		if tj.IsZero() {
 			tj = allEvents[j].CreationTimestamp.Time
 		}
@@ -1140,7 +1185,7 @@ func (h *WorkloadHandlers) GetDeployLogs(c *fiber.Ctx) error {
 
 // formatEvent formats a k8s event into a compact log line for mission display.
 func formatEvent(ev corev1.Event) string {
-	ts := ev.LastTimestamp.Time
+	ts := k8s.EffectiveEventTime(&ev)
 	if ts.IsZero() {
 		ts = ev.CreationTimestamp.Time
 	}

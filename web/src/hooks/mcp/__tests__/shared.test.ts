@@ -360,7 +360,10 @@ describe('deduplicateClustersByServer', () => {
     }
   })
 
-  it('merges best nodeCount and podCount from duplicates', () => {
+  it('uses the primary cluster nodeCount and podCount (does not take max) — #6112', () => {
+    // Regression for #6112: previously this code used Math.max(primary, alias)
+    // which caused scale-downs to show stale over-counts. Now the primary
+    // cluster is authoritative and aliases only fill in undefined fields.
     const NODE_COUNT_5 = 5
     const POD_COUNT_20 = 20
     const NODE_COUNT_8 = 8
@@ -368,8 +371,33 @@ describe('deduplicateClustersByServer', () => {
     const c1 = makeCluster({ name: 'c1', server: 'https://s1', nodeCount: NODE_COUNT_5, podCount: POD_COUNT_20 })
     const c2 = makeCluster({ name: 'c2', server: 'https://s1', nodeCount: NODE_COUNT_8, podCount: POD_COUNT_50 })
     const result = deduplicateClustersByServer([c1, c2])
+    // c1 sorts first (same length, stable) so it becomes primary; its counts win
+    expect(result[0].nodeCount).toBe(NODE_COUNT_5)
+    expect(result[0].podCount).toBe(POD_COUNT_20)
+  })
+
+  it('falls back to alias nodeCount/podCount when primary has none — #6112', () => {
+    const NODE_COUNT_8 = 8
+    const POD_COUNT_50 = 50
+    // Primary is chosen by sort; c1 is primary and has no nodeCount/podCount
+    // (makeCluster() defaults to 3 so we override explicitly).
+    const c1 = makeCluster({ name: 'c1', server: 'https://s1', nodeCount: undefined, podCount: undefined })
+    const c2 = makeCluster({ name: 'c2', server: 'https://s1', nodeCount: NODE_COUNT_8, podCount: POD_COUNT_50 })
+    const result = deduplicateClustersByServer([c1, c2])
     expect(result[0].nodeCount).toBe(NODE_COUNT_8)
     expect(result[0].podCount).toBe(POD_COUNT_50)
+  })
+
+  it('does not over-count after scale-down — #6112', () => {
+    // Scenario: upstream reports 3 nodes after a scale-down; a recent alias
+    // still has a cached 10. Old behavior returned 10 (Math.max). New behavior
+    // must return the primary's 3.
+    const NODES_AFTER_SCALE_DOWN = 3
+    const STALE_NODES_ON_ALIAS = 10
+    const primary = makeCluster({ name: 'prod', server: 'https://s1', nodeCount: NODES_AFTER_SCALE_DOWN })
+    const alias = makeCluster({ name: 'prod-long-context', server: 'https://s1', nodeCount: STALE_NODES_ON_ALIAS })
+    const result = deduplicateClustersByServer([primary, alias])
+    expect(result[0].nodeCount).toBe(NODES_AFTER_SCALE_DOWN)
   })
 
   it('marks healthy if any duplicate is healthy', () => {
@@ -595,11 +623,13 @@ describe('updateSingleClusterInCache', () => {
     expect(c.healthy).toBe(true) // preserved original
   })
 
-  it('preserves positive metric values when new value is 0', () => {
+  it('accepts zero metric value (no longer falls back to cache)', () => {
+    // PR #5449: pickMetric no longer preserves cached values — a real zero
+    // (e.g. scaled-to-zero) must be respected (see #5443)
     updateSingleClusterInCache('c1', { cpuCores: 0 })
     vi.advanceTimersByTime(CLUSTER_NOTIFY_DEBOUNCE_MS)
     const c = clusterCache.clusters.find(c => c.name === 'c1')!
-    expect(c.cpuCores).toBe(8) // kept original positive value
+    expect(c.cpuCores).toBe(0)
   })
 
   it('applies zero metric when no prior positive value exists for that cluster', () => {
@@ -617,12 +647,13 @@ describe('updateSingleClusterInCache', () => {
     expect(c.cpuCores === 0 || c.cpuCores === undefined).toBe(true)
   })
 
-  it('does not set reachable=false when cluster has valid nodeCount', () => {
+  it('applies reachable=false even when cluster has valid nodeCount', () => {
+    // PR #5449: reachability is no longer blocked by node count — the useMCP
+    // hook gates reachable=false behind 5 min of failures, so it's authoritative (#5444)
     updateSingleClusterInCache('c1', { reachable: false })
     vi.advanceTimersByTime(CLUSTER_NOTIFY_DEBOUNCE_MS)
     const c = clusterCache.clusters.find(c => c.name === 'c1')!
-    // nodeCount=3 means we have valid cached data, reachable should stay true
-    expect(c.reachable).not.toBe(false)
+    expect(c.reachable).toBe(false)
   })
 
   it('allows reachable=false when cluster has no valid cached node data', () => {
@@ -1206,8 +1237,17 @@ describe('fullFetchClusters', () => {
     vi.restoreAllMocks()
   })
 
-  it('returns demo clusters when isDemoMode() is true', async () => {
+  it('returns demo clusters when isDemoMode() is true and demo token is set', async () => {
+    // #6243 dropped the unconditional demo-mode short-circuit. Demo data
+    // is now returned only when:
+    //   1) Netlify forced demo, OR
+    //   2) fetchClusterListFromAgent() returns null AND
+    //      isDemoMode() && isDemoToken() are both true.
+    // Tests must mock both flags AND make agent fetch fail so the demo
+    // fallback branch fires.
     mockIsDemoMode.mockReturnValue(true)
+    mockIsDemoToken.mockReturnValue(true)
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('agent down'))
     await fullFetchClusters()
     expect(clusterCache.clusters.length).toBeGreaterThan(0)
     expect(clusterCache.isLoading).toBe(false)
@@ -2105,39 +2145,40 @@ describe('updateSingleClusterInCache — multiple metrics keys protection', () =
     vi.useRealTimers()
   })
 
-  it('protects memoryGB from being overwritten with zero', () => {
+  it('allows memoryGB to be overwritten with zero', () => {
+    // PR #5449: zero is a valid metric value (scaled-to-zero) — no longer preserved
     updateSingleClusterInCache('metrics-protect', { memoryGB: 0 })
     vi.advanceTimersByTime(CLUSTER_NOTIFY_DEBOUNCE_MS)
     const c = clusterCache.clusters.find(c => c.name === 'metrics-protect')!
-    expect(c.memoryGB).toBe(64)
+    expect(c.memoryGB).toBe(0)
   })
 
-  it('protects storageGB from being overwritten with zero', () => {
+  it('allows storageGB to be overwritten with zero', () => {
     updateSingleClusterInCache('metrics-protect', { storageGB: 0 })
     vi.advanceTimersByTime(CLUSTER_NOTIFY_DEBOUNCE_MS)
     const c = clusterCache.clusters.find(c => c.name === 'metrics-protect')!
-    expect(c.storageGB).toBe(200)
+    expect(c.storageGB).toBe(0)
   })
 
-  it('protects cpuRequestsMillicores from being overwritten with zero', () => {
+  it('allows cpuRequestsMillicores to be overwritten with zero', () => {
     updateSingleClusterInCache('metrics-protect', { cpuRequestsMillicores: 0 })
     vi.advanceTimersByTime(CLUSTER_NOTIFY_DEBOUNCE_MS)
     const c = clusterCache.clusters.find(c => c.name === 'metrics-protect')!
-    expect(c.cpuRequestsMillicores).toBe(4000)
+    expect(c.cpuRequestsMillicores).toBe(0)
   })
 
-  it('protects memoryRequestsBytes from being overwritten with zero', () => {
+  it('allows memoryRequestsBytes to be overwritten with zero', () => {
     updateSingleClusterInCache('metrics-protect', { memoryRequestsBytes: 0 })
     vi.advanceTimersByTime(CLUSTER_NOTIFY_DEBOUNCE_MS)
     const c = clusterCache.clusters.find(c => c.name === 'metrics-protect')!
-    expect(c.memoryRequestsBytes).toBe(1024)
+    expect(c.memoryRequestsBytes).toBe(0)
   })
 
-  it('protects memoryRequestsGB from being overwritten with zero', () => {
+  it('allows memoryRequestsGB to be overwritten with zero', () => {
     updateSingleClusterInCache('metrics-protect', { memoryRequestsGB: 0 })
     vi.advanceTimersByTime(CLUSTER_NOTIFY_DEBOUNCE_MS)
     const c = clusterCache.clusters.find(c => c.name === 'metrics-protect')!
-    expect(c.memoryRequestsGB).toBe(32)
+    expect(c.memoryRequestsGB).toBe(0)
   })
 
   it('allows updating metrics with positive new values', () => {

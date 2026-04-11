@@ -48,6 +48,7 @@ type MultiClusterClient struct {
 	watcher         *fsnotify.Watcher
 	stopWatch       chan struct{}
 	onReload        func()               // Callback when config is reloaded
+	onWatchError    func(error)          // Callback when watchLoop encounters an error (#5569)
 	inClusterConfig *rest.Config         // In-cluster config when running inside k8s
 	inClusterName   string               // Detected friendly name for in-cluster (e.g. "fmaas-vllm-d")
 	slowClusters    map[string]time.Time // clusters that recently timed out (reduced timeout)
@@ -404,6 +405,23 @@ type Deployment struct {
 	Annotations       map[string]string `json:"annotations,omitempty"`
 }
 
+// ServicePortDetail is a structured view of a ServicePort that preserves
+// the optional port name (issue #6163). The legacy Ports []string field is
+// retained for backwards compatibility; new code should prefer this.
+type ServicePortDetail struct {
+	// Name of the port as defined on the k8s ServicePort (may be empty).
+	// When present it is a well-known name like "http" or "metrics" that
+	// operators configure to identify a port across the cluster.
+	Name     string `json:"name,omitempty"`
+	// Port is the service-level port (spec.ports[].port).
+	Port     int32  `json:"port"`
+	// Protocol is TCP / UDP / SCTP.
+	Protocol string `json:"protocol,omitempty"`
+	// NodePort is the externally-exposed port for NodePort / LoadBalancer
+	// services. Zero for ClusterIP services.
+	NodePort int32  `json:"nodePort,omitempty"`
+}
+
 // Service represents a Kubernetes service
 type Service struct {
 	Name        string            `json:"name"`
@@ -412,11 +430,48 @@ type Service struct {
 	Type        string            `json:"type"` // ClusterIP, NodePort, LoadBalancer, ExternalName
 	ClusterIP   string            `json:"clusterIP,omitempty"`
 	ExternalIP  string            `json:"externalIP,omitempty"`
+	// Ports is the legacy flat string representation of the ports, kept
+	// for existing consumers. Format: "80/TCP" or "80:30080/TCP" when a
+	// NodePort is allocated. Prefer PortDetails for new code.
 	Ports       []string          `json:"ports,omitempty"`
+	// PortDetails is the structured representation of the ServicePorts
+	// including the optional name field (issue #6163). Same length and
+	// ordering as Ports.
+	PortDetails []ServicePortDetail `json:"portDetails,omitempty"`
+	// Endpoints is the number of ready backend addresses summed across all
+	// subsets of the matching core/v1 Endpoints object (i.e. actual pod
+	// endpoints backing the service, NOT the number of services themselves).
+	// Issue #6150: the Services dashboard stat should sum this value across
+	// services instead of counting services.
+	Endpoints int `json:"endpoints"`
+	// LBStatus describes the provisioning state of a LoadBalancer service.
+	// For non-LoadBalancer services this is the empty string. For a
+	// LoadBalancer service this is either LBStatusReady (ingress IP/hostname
+	// has been assigned) or LBStatusProvisioning (cloud provider has not yet
+	// provisioned an address). Issue #6153.
+	LBStatus    string            `json:"lbStatus,omitempty"`
+	// Selector is the label selector used by the service to match backing
+	// pods (corev1.ServiceSpec.Selector). Surfaced so the frontend can
+	// detect orphaned services (selector present but no matching pods,
+	// issue #6164) and services with an empty selector that are not
+	// ExternalName (config bug, issue #6166). nil for ExternalName.
+	Selector    map[string]string `json:"selector,omitempty"`
 	Age         string            `json:"age,omitempty"`
 	Labels      map[string]string `json:"labels,omitempty"`
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
+
+// LoadBalancer provisioning status values. Defined as exported constants so
+// the frontend/backend agree on the wire format and there are no magic
+// strings sprinkled through the code.
+const (
+	// LBStatusProvisioning means the service is type=LoadBalancer but the
+	// cloud provider has not yet populated status.loadBalancer.ingress.
+	LBStatusProvisioning = "Provisioning"
+	// LBStatusReady means status.loadBalancer.ingress has at least one
+	// IP or hostname populated.
+	LBStatusReady = "Ready"
+)
 
 // Job represents a Kubernetes job
 type Job struct {
@@ -752,6 +807,68 @@ func (m *MultiClusterClient) LoadConfig() error {
 	return nil
 }
 
+// RemoveContext deletes a context (and its associated cluster/user entries if
+// they are not shared by other contexts) from the kubeconfig file (#5658).
+func (m *MultiClusterClient) RemoveContext(contextName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	config, err := clientcmd.LoadFromFile(m.kubeconfig)
+	if err != nil {
+		return fmt.Errorf("failed to load kubeconfig: %w", err)
+	}
+
+	ctx, ok := config.Contexts[contextName]
+	if !ok {
+		return fmt.Errorf("context %q not found", contextName)
+	}
+
+	// Don't allow removing the current context
+	if config.CurrentContext == contextName {
+		return fmt.Errorf("cannot remove the current context %q", contextName)
+	}
+
+	clusterName := ctx.Cluster
+	userName := ctx.AuthInfo
+
+	// Remove the context
+	delete(config.Contexts, contextName)
+
+	// Check if the cluster/user are still referenced by other contexts
+	clusterUsed := false
+	userUsed := false
+	for _, c := range config.Contexts {
+		if c.Cluster == clusterName {
+			clusterUsed = true
+		}
+		if c.AuthInfo == userName {
+			userUsed = true
+		}
+	}
+	if !clusterUsed {
+		delete(config.Clusters, clusterName)
+	}
+	if !userUsed {
+		delete(config.AuthInfos, userName)
+	}
+
+	// Write back
+	if err := clientcmd.WriteToFile(*config, m.kubeconfig); err != nil {
+		return fmt.Errorf("failed to write kubeconfig: %w", err)
+	}
+
+	// Clear cached clients for the removed context
+	delete(m.clients, contextName)
+	delete(m.dynamicClients, contextName)
+	delete(m.configs, contextName)
+	delete(m.healthCache, contextName)
+	delete(m.cacheTime, contextName)
+
+	m.rawConfig = config
+	slog.Info("Removed kubeconfig context", "context", contextName)
+	return nil
+}
+
 // StartWatching starts watching the kubeconfig file for changes.
 // Uses fsnotify for instant detection plus a polling fallback every 5s
 // to catch changes that fsnotify misses (common on macOS after atomic writes).
@@ -788,6 +905,12 @@ func (m *MultiClusterClient) reloadAndNotify() {
 	slog.Info("Kubeconfig changed, reloading...")
 	if err := m.LoadConfig(); err != nil {
 		slog.Error("error reloading kubeconfig", "error", err)
+		m.mu.RLock()
+		errCallback := m.onWatchError
+		m.mu.RUnlock()
+		if errCallback != nil {
+			errCallback(err)
+		}
 		return
 	}
 	slog.Info("Kubeconfig reloaded successfully")
@@ -887,6 +1010,14 @@ func (m *MultiClusterClient) SetOnReload(callback func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onReload = callback
+}
+
+// SetOnWatchError sets a callback invoked when the kubeconfig watcher encounters
+// an error (e.g., reload failure). Allows callers to monitor watcher health (#5569).
+func (m *MultiClusterClient) SetOnWatchError(callback func(error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onWatchError = callback
 }
 
 // ListClusters returns all clusters from kubeconfig

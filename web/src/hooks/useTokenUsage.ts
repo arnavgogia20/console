@@ -3,12 +3,43 @@ import { isAgentUnavailable, reportAgentDataSuccess, reportAgentDataError } from
 import { getDemoMode } from './useDemoMode'
 import { LOCAL_AGENT_HTTP_URL } from '../lib/constants'
 import { QUICK_ABORT_TIMEOUT_MS } from '../lib/constants/network'
+import {
+  getUserTokenUsage,
+  postTokenDelta,
+  TokenUsageUnauthenticatedError,
+  type UserTokenUsageRecord,
+} from '../lib/tokenUsageApi'
 
 /** Maximum token delta to attribute in a single poll cycle (prevents init spikes) */
 const MAX_SINGLE_DELTA_TOKENS = 50_000
 
 /** Minimum valid stop threshold — prevents "AI Disabled" at 0% from corrupted localStorage */
 const MIN_STOP_THRESHOLD = 0.01
+
+/** localStorage key for the persisted last-known total token count (agent restart detection) */
+const LAST_KNOWN_USAGE_KEY = 'kc:tokenUsage:lastKnown'
+
+/** localStorage key for the persisted agent session marker (agent restart detection) */
+const AGENT_SESSION_KEY = 'kc:tokenUsage:agentSession'
+
+/** Default category used when a delta arrives with no active operation */
+const DEFAULT_CATEGORY: TokenCategory = 'other'
+
+/**
+ * Maximum age (ms) of an unflushed pending delta before it MUST be sent to the
+ * backend even if the threshold-based trigger has not fired. Keeping this short
+ * means a logged-in user who closes the tab loses at most ~30s of attribution
+ * if `sendBeacon` is unavailable.
+ */
+const TOKEN_USAGE_FLUSH_INTERVAL_MS = 30_000
+
+/**
+ * Minimum total tokens accumulated across pending deltas before triggering a
+ * flush. Caps backend write traffic on heavy-usage sessions: ~1 POST per
+ * `TOKEN_USAGE_FLUSH_THRESHOLD` tokens of activity, regardless of how many
+ * individual deltas the local agent reports.
+ */
+const TOKEN_USAGE_FLUSH_THRESHOLD = 100
 
 export type TokenCategory = 'missions' | 'diagnose' | 'insights' | 'predictions' | 'other'
 
@@ -70,53 +101,290 @@ let pollStarted = false
 let pollIntervalId: ReturnType<typeof setInterval> | null = null
 const subscribers = new Set<(usage: TokenUsage) => void>()
 
-// Track active AI operation for attributing token usage
-let activeCategory: TokenCategory | null = null
-let lastKnownUsage: number | null = null // null means not yet initialized
+// Track all active AI operations for attributing token usage.
+// Keyed by a stable operation id (e.g. missionId, analyze-call uuid) so
+// concurrent operations across multiple tabs/cards don't clobber each
+// other — the previous module-level `let activeCategory` variable caused
+// bug #6016 where starting a second operation rerouted the first one's
+// tokens to the wrong category.
+const activeCategoriesByOp = new Map<string, TokenCategory>()
+
+// Persisted baseline for total token count reported by the local agent.
+// This is loaded from localStorage on module init so that an agent restart
+// (which resets `today` counters to a lower value) can be distinguished from
+// real usage growth — see bug #6015 and the restart-detection logic below.
+let lastKnownUsage: number | null = null
+let lastKnownSessionId: string | null = null
 
 /**
- * Set the currently active AI operation category.
- * Call this when starting an AI operation (mission, diagnose, etc.)
+ * Set the active token category for a specific operation id.
+ * The opId should be stable for the lifetime of the operation (mission id,
+ * analyze-call uuid, etc.) so concurrent operations are tracked separately.
  */
-export function setActiveTokenCategory(category: TokenCategory | null) {
-  activeCategory = category
+export function setActiveTokenCategory(opId: string, category: TokenCategory) {
+  activeCategoriesByOp.set(opId, category)
 }
 
 /**
- * Get the currently active category (for debugging/display)
+ * Clear the active token category for a specific operation id.
+ * Call this when the operation completes (success, failure, or cancel).
  */
-export function getActiveTokenCategory(): TokenCategory | null {
-  return activeCategory
+export function clearActiveTokenCategory(opId: string) {
+  activeCategoriesByOp.delete(opId)
+}
+
+/**
+ * Return the set of currently active categories. Exposed for debugging.
+ */
+export function getActiveTokenCategories(): TokenCategory[] {
+  return Array.from(activeCategoriesByOp.values())
+}
+
+/**
+ * Safely load the persisted last-known usage + agent session marker from
+ * localStorage. Returns null fields if localStorage is unavailable (SSR,
+ * private mode) or the stored data is corrupted.
+ */
+function loadPersistedUsage(): { lastKnown: number | null; sessionId: string | null } {
+  if (typeof window === 'undefined') return { lastKnown: null, sessionId: null }
+  try {
+    const rawLastKnown = localStorage.getItem(LAST_KNOWN_USAGE_KEY)
+    const rawSession = localStorage.getItem(AGENT_SESSION_KEY)
+    const lastKnown = rawLastKnown !== null ? Number(rawLastKnown) : null
+    return {
+      lastKnown: lastKnown !== null && Number.isFinite(lastKnown) ? lastKnown : null,
+      sessionId: rawSession,
+    }
+  } catch {
+    // localStorage may throw in private mode or when quota is exceeded.
+    return { lastKnown: null, sessionId: null }
+  }
+}
+
+/**
+ * Safely persist the last-known usage baseline + agent session marker to
+ * localStorage. Silently ignores quota/SSR/private-mode errors — persistence
+ * is best-effort and losing it only degrades restart detection on the next
+ * page load.
+ */
+function persistUsage(lastKnown: number, sessionId: string | null): void {
+  if (typeof window === 'undefined') return
+  try {
+    localStorage.setItem(LAST_KNOWN_USAGE_KEY, String(lastKnown))
+    if (sessionId !== null) {
+      localStorage.setItem(AGENT_SESSION_KEY, sessionId)
+    }
+  } catch {
+    // Quota exceeded / private mode — ignore, this is best-effort.
+  }
+}
+
+// Hydrate the in-memory baseline from localStorage at module init so that
+// page reloads and new tabs don't mis-attribute the entire current usage
+// count as fresh delta on the first poll.
+{
+  const persisted = loadPersistedUsage()
+  lastKnownUsage = persisted.lastKnown
+  lastKnownSessionId = persisted.sessionId
+}
+
+// --- Backend persistence layer (folded into PR #6032) ----------------------
+//
+// localStorage remains the fast cache (kept from PR #6020) but the server is
+// now the source of truth. On the first hook mount we hydrate from
+// `GET /api/token-usage/me`; subsequent deltas are mirrored to
+// `POST /api/token-usage/delta` via a debounced flusher so heavy-usage
+// sessions don't pound the API. Demo mode and unauth sessions skip the
+// backend entirely and continue to use localStorage only.
+
+/** True once we've successfully hydrated `sharedUsage` from the backend. */
+let backendHydrated = false
+/** True if a previous backend call returned 401 — disables further calls. */
+let backendUnauthenticated = false
+
+/**
+ * Pending per-category deltas accumulated since the last successful flush.
+ * Counts are non-negative; we never push negative deltas to the server (that
+ * would only happen on a baseline reset, which is handled by the
+ * GET-on-mount path, not by mirroring deltas).
+ */
+const pendingDeltas = new Map<TokenCategory, number>()
+let pendingDeltaTotal = 0
+let flushTimerId: ReturnType<typeof setTimeout> | null = null
+
+/**
+ * Hydrate the singleton `sharedUsage.byCategory` map from a backend record.
+ * Called from `startPolling` exactly once per session — not per hook instance.
+ * Demo mode and unauth sessions skip this entirely.
+ */
+async function hydrateFromBackend(): Promise<void> {
+  if (backendHydrated || backendUnauthenticated) return
+  if (typeof window === 'undefined') return
+  if (getDemoMode()) return
+  try {
+    const record: UserTokenUsageRecord = await getUserTokenUsage()
+    backendHydrated = true
+    // Merge: any byCategory keys present on the server overwrite local
+    // counters; categories the server doesn't know about (e.g. localStorage
+    // from a stale build) are preserved so we don't drop in-flight totals.
+    const merged: TokenUsageByCategory = { ...sharedUsage.byCategory }
+    for (const cat of ['missions', 'diagnose', 'insights', 'predictions', 'other'] as const) {
+      const v = record.tokens_by_category?.[cat]
+      if (typeof v === 'number' && Number.isFinite(v)) {
+        merged[cat] = v
+      }
+    }
+    // The backend marker overrides the localStorage one — server wins.
+    if (record.last_agent_session_id) {
+      lastKnownSessionId = record.last_agent_session_id
+    }
+    updateSharedUsage({ byCategory: merged }, true)
+  } catch (err) {
+    if (err instanceof TokenUsageUnauthenticatedError) {
+      backendUnauthenticated = true
+      return
+    }
+    // Network / 5xx — leave backendHydrated=false so we retry on the next
+    // hook mount, but don't crash polling.
+  }
+}
+
+/**
+ * Queue a per-category delta for backend flush. Called from the polling
+ * attribution path immediately after `updateSharedUsage`. Skipped in demo
+ * mode and after a 401.
+ */
+function queueBackendDelta(category: TokenCategory, delta: number): void {
+  if (backendUnauthenticated) return
+  if (typeof window === 'undefined') return
+  if (getDemoMode()) return
+  if (delta <= 0) return
+
+  pendingDeltas.set(category, (pendingDeltas.get(category) ?? 0) + delta)
+  pendingDeltaTotal += delta
+
+  if (pendingDeltaTotal >= TOKEN_USAGE_FLUSH_THRESHOLD) {
+    void flushPendingDeltas()
+    return
+  }
+  if (flushTimerId === null) {
+    flushTimerId = setTimeout(() => { void flushPendingDeltas() }, TOKEN_USAGE_FLUSH_INTERVAL_MS)
+  }
+}
+
+/**
+ * Flush all accumulated per-category deltas to the backend. Each category is
+ * sent as a separate `POST /api/token-usage/delta` so the server can track
+ * the per-category totals atomically. Failures swallow silently — the
+ * localStorage cache still has the data and the next page load will reconcile.
+ */
+async function flushPendingDeltas(): Promise<void> {
+  if (flushTimerId !== null) {
+    clearTimeout(flushTimerId)
+    flushTimerId = null
+  }
+  if (pendingDeltas.size === 0) return
+  // Snapshot and clear before awaiting so concurrent attributions don't
+  // double-send the same numbers.
+  const snapshot = Array.from(pendingDeltas.entries())
+  pendingDeltas.clear()
+  pendingDeltaTotal = 0
+
+  for (const [category, delta] of snapshot) {
+    if (delta <= 0) continue
+    try {
+      await postTokenDelta({
+        category,
+        delta,
+        agent_session_id: lastKnownSessionId ?? '',
+      })
+    } catch (err) {
+      if (err instanceof TokenUsageUnauthenticatedError) {
+        backendUnauthenticated = true
+        return
+      }
+      // Network blip — re-queue so the next flush picks it up.
+      pendingDeltas.set(category, (pendingDeltas.get(category) ?? 0) + delta)
+      pendingDeltaTotal += delta
+    }
+  }
+}
+
+// Best-effort flush on tab close. `sendBeacon` is keepalive so it survives
+// the unload — but only if the user is authenticated and there is something
+// pending. Browsers without sendBeacon fall back to the queued flush, which
+// will run if the user reopens the tab.
+//
+// #6202: This used to register an anonymous arrow function as the listener,
+// which made it impossible to remove. Vite HMR re-evaluates this module on
+// every hot reload, so each reload accumulated another listener — closing
+// the tab would fire all N copies and send N duplicate beacons. Now uses a
+// named function reference and a module-level guard so re-evaluation under
+// HMR replaces the listener instead of stacking copies. The guard also
+// removes the prior listener using the captured reference (safe even if
+// the previous run is gone, removeEventListener is a no-op for unknowns).
+function flushPendingDeltasOnPagehide(): void {
+  if (backendUnauthenticated || pendingDeltas.size === 0) return
+  if (typeof navigator.sendBeacon !== 'function') return
+  for (const [category, delta] of pendingDeltas.entries()) {
+    if (delta <= 0) continue
+    const body = new Blob(
+      [JSON.stringify({ category, delta, agent_session_id: lastKnownSessionId ?? '' })],
+      { type: 'application/json' }
+    )
+    try {
+      navigator.sendBeacon('/api/token-usage/delta', body)
+    } catch {
+      // Ignore — best effort only.
+    }
+  }
+  pendingDeltas.clear()
+  pendingDeltaTotal = 0
+}
+
+if (typeof window !== 'undefined' && typeof navigator !== 'undefined') {
+  // HMR cleanup — remove any stale listener from a previous module instance
+  // before installing the new one.
+  const existing = (window as unknown as { __kcTokenUsagePagehide?: () => void }).__kcTokenUsagePagehide
+  if (existing) {
+    window.removeEventListener('pagehide', existing)
+  }
+  window.addEventListener('pagehide', flushPendingDeltasOnPagehide)
+  ;(window as unknown as { __kcTokenUsagePagehide?: () => void }).__kcTokenUsagePagehide = flushPendingDeltasOnPagehide
 }
 
 // Initialize from localStorage
 if (typeof window !== 'undefined') {
-  const settings = localStorage.getItem(SETTINGS_KEY)
-  if (settings) {
-    const parsedSettings = JSON.parse(settings)
-    sharedUsage = { ...sharedUsage, ...parsedSettings }
-    // Ensure limit is never zero/negative (causes NaN in percentage calculations)
-    if (sharedUsage.limit <= 0) sharedUsage.limit = DEFAULT_SETTINGS.limit
-    // Ensure thresholds are sane — corrupted stopThreshold=0 causes "AI Disabled" at 0% usage
-    if (!sharedUsage.stopThreshold || sharedUsage.stopThreshold < MIN_STOP_THRESHOLD) {
-      sharedUsage.stopThreshold = DEFAULT_SETTINGS.stopThreshold
+  try {
+    const settings = localStorage.getItem(SETTINGS_KEY)
+    if (settings) {
+      const parsedSettings = JSON.parse(settings)
+      sharedUsage = { ...sharedUsage, ...parsedSettings }
+      // Ensure limit is never zero/negative (causes NaN in percentage calculations)
+      if (sharedUsage.limit <= 0) sharedUsage.limit = DEFAULT_SETTINGS.limit
+      // Ensure thresholds are sane — corrupted stopThreshold=0 causes "AI Disabled" at 0% usage
+      if (!sharedUsage.stopThreshold || sharedUsage.stopThreshold < MIN_STOP_THRESHOLD) {
+        sharedUsage.stopThreshold = DEFAULT_SETTINGS.stopThreshold
+      }
+      if (!sharedUsage.criticalThreshold || sharedUsage.criticalThreshold <= 0) {
+        sharedUsage.criticalThreshold = DEFAULT_SETTINGS.criticalThreshold
+      }
+      if (!sharedUsage.warningThreshold || sharedUsage.warningThreshold <= 0) {
+        sharedUsage.warningThreshold = DEFAULT_SETTINGS.warningThreshold
+      }
     }
-    if (!sharedUsage.criticalThreshold || sharedUsage.criticalThreshold <= 0) {
-      sharedUsage.criticalThreshold = DEFAULT_SETTINGS.criticalThreshold
-    }
-    if (!sharedUsage.warningThreshold || sharedUsage.warningThreshold <= 0) {
-      sharedUsage.warningThreshold = DEFAULT_SETTINGS.warningThreshold
-    }
+  } catch {
+    // Corrupted settings JSON — fall back to defaults.
   }
   // Load persisted category data
-  const categoryData = localStorage.getItem(CATEGORY_KEY)
-  if (categoryData) {
-    try {
+  try {
+    const categoryData = localStorage.getItem(CATEGORY_KEY)
+    if (categoryData) {
       const parsedCategories = JSON.parse(categoryData)
       sharedUsage.byCategory = { ...DEFAULT_BY_CATEGORY, ...parsedCategories }
-    } catch {
-      // Ignore invalid data
     }
+  } catch {
+    // Ignore invalid data — start from zeroed byCategory.
   }
   // Set demo usage if in demo mode
   if (getDemoMode()) {
@@ -196,22 +464,82 @@ async function fetchTokenUsage() {
         // Track both input and output tokens
         const totalUsed = (todayTokens.input || 0) + (todayTokens.output || 0)
 
-        // Attribute token increase to active category (only after initialization)
-        if (lastKnownUsage !== null && totalUsed > lastKnownUsage && activeCategory) {
+        // --- Agent restart detection (bug #6015) ----------------------------
+        // The local kc-agent reports a `today` counter that resets to zero
+        // whenever the agent process restarts. Without detecting restarts we
+        // would either:
+        //   (a) attribute the full new total as a single huge delta, or
+        //   (b) silently swallow real usage because totalUsed < lastKnownUsage.
+        // We detect a restart by either:
+        //   1. The agent session marker changing (preferred — exact signal), or
+        //   2. totalUsed going backwards compared to our persisted baseline.
+        // On restart we reset the baseline without attributing a delta. The
+        // baseline is also persisted to localStorage so a page reload doesn't
+        // mis-attribute the current running total as fresh usage.
+        const reportedSessionId: string | null = data.claude?.agentSessionId ?? null
+        const sessionChanged =
+          reportedSessionId !== null &&
+          lastKnownSessionId !== null &&
+          reportedSessionId !== lastKnownSessionId
+        const wentBackwards = lastKnownUsage !== null && totalUsed < lastKnownUsage
+        const isRestart = sessionChanged || wentBackwards
+
+        if (isRestart || lastKnownUsage === null) {
+          // Reset baseline without attributing any delta. On first init
+          // (lastKnownUsage === null) we also take this branch to establish
+          // a baseline without pretending all current usage happened just now.
+          updateSharedUsage({ used: totalUsed })
+        } else if (totalUsed > lastKnownUsage) {
           const delta = totalUsed - lastKnownUsage
-          // Sanity check: don't attribute more than 50k tokens at once (likely a bug)
+          // Sanity check: don't attribute more than MAX_SINGLE_DELTA_TOKENS
+          // at once (likely a bug / init race).
           if (delta < MAX_SINGLE_DELTA_TOKENS) {
-            const newByCategory = { ...sharedUsage.byCategory }
-            newByCategory[activeCategory] += delta
-            updateSharedUsage({ used: totalUsed, byCategory: newByCategory })
+            const activeCount = activeCategoriesByOp.size
+            if (activeCount === 0) {
+              // No active operation — attribute to the default category.
+              const newByCategory = { ...sharedUsage.byCategory }
+              newByCategory[DEFAULT_CATEGORY] += delta
+              updateSharedUsage({ used: totalUsed, byCategory: newByCategory })
+              queueBackendDelta(DEFAULT_CATEGORY, delta)
+            } else if (activeCount === 1) {
+              // Single operation — attribute the entire delta to it.
+              const category = activeCategoriesByOp.values().next().value as TokenCategory
+              const newByCategory = { ...sharedUsage.byCategory }
+              newByCategory[category] += delta
+              updateSharedUsage({ used: totalUsed, byCategory: newByCategory })
+              queueBackendDelta(category, delta)
+            } else {
+              // Multiple concurrent operations — split the delta evenly
+              // across all active operations. This is a best-effort
+              // heuristic: the local agent reports only an aggregate count,
+              // so we cannot perfectly attribute per-operation usage. Any
+              // remainder from integer division goes to the first operation.
+              const perOp = Math.floor(delta / activeCount)
+              const remainder = delta - perOp * activeCount
+              const newByCategory = { ...sharedUsage.byCategory }
+              let first = true
+              for (const category of activeCategoriesByOp.values()) {
+                const portion = perOp + (first ? remainder : 0)
+                newByCategory[category] += portion
+                queueBackendDelta(category, portion)
+                first = false
+              }
+              updateSharedUsage({ used: totalUsed, byCategory: newByCategory })
+            }
           } else {
             console.warn(`[TokenUsage] Skipping large delta ${delta} - likely initialization`)
             updateSharedUsage({ used: totalUsed })
           }
         } else {
+          // totalUsed === lastKnownUsage — nothing to attribute.
           updateSharedUsage({ used: totalUsed })
         }
+
         lastKnownUsage = totalUsed
+        if (reportedSessionId !== null) {
+          lastKnownSessionId = reportedSessionId
+        }
+        persistUsage(totalUsed, reportedSessionId)
       }
     } else {
       reportAgentDataError('/health (token)', `HTTP ${response.status}`)
@@ -225,6 +553,10 @@ async function fetchTokenUsage() {
 function startPolling() {
   if (pollStarted) return
   pollStarted = true
+
+  // One-shot backend hydrate before the first poll attribution. Demo mode
+  // and unauth sessions are no-ops inside hydrateFromBackend.
+  void hydrateFromBackend()
 
   // Initial fetch
   fetchTokenUsage()

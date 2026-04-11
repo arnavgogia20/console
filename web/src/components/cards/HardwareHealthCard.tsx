@@ -5,6 +5,7 @@ import { useCardLoadingState } from './CardDataContext'
 import { CardControlsRow, CardSearchInput, CardPaginationFooter, CardAIActions } from '../../lib/cards/CardComponents'
 import { ClusterBadge } from '../ui/ClusterBadge'
 import { StatusBadge } from '../ui/StatusBadge'
+import { RefreshIndicator } from '../ui/RefreshIndicator'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
 import { useClusters } from '../../hooks/useMCP'
 import { useCachedHardwareHealth, type DeviceAlert, type NodeDeviceInventory, type DeviceCounts } from '../../hooks/useCachedData'
@@ -427,12 +428,13 @@ export function HardwareHealthCard() {
   const currentNeedsPagination = viewMode === 'alerts' ? needsPagination : inventoryNeedsPagination
   const currentTotalItems = viewMode === 'alerts' ? sortedAlerts.length : sortedInventory.length
 
-  // Ensure current page is valid for current view
+  // Ensure current page is valid for current view (#5762).
+  // Only depend on currentTotalPages — including currentPage risks infinite loop.
   useEffect(() => {
-    if (currentPage > currentTotalPages) {
-      setCurrentPage(Math.max(1, currentTotalPages))
+    if (currentTotalPages > 0 && currentPage > currentTotalPages) {
+      setCurrentPage(currentTotalPages)
     }
-  }, [currentPage, currentTotalPages])
+  }, [currentTotalPages]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /** Auto-dismiss delay for alert clear error messages */
   const CLEAR_ERROR_DISMISS_MS = 5000
@@ -456,8 +458,8 @@ export function HardwareHealthCard() {
         <div className={cn(
           'p-2 rounded-lg border',
           criticalCount > 0
-            ? 'bg-red-500/20 border-red-500/30'
-            : 'bg-green-500/20 border-green-500/30'
+            ? 'bg-red-500/20 border-red-500/20'
+            : 'bg-green-500/20 border-green-500/20'
         )}>
           <div className="text-xl font-bold text-foreground">{criticalCount}</div>
           <div className={cn('text-2xs', criticalCount > 0 ? 'text-red-400' : 'text-green-400')}>
@@ -467,8 +469,8 @@ export function HardwareHealthCard() {
         <div className={cn(
           'p-2 rounded-lg border',
           warningCount > 0
-            ? 'bg-yellow-500/20 border-yellow-500/30'
-            : 'bg-green-500/20 border-green-500/30'
+            ? 'bg-yellow-500/20 border-yellow-500/20'
+            : 'bg-green-500/20 border-green-500/20'
         )}>
           <div className="text-xl font-bold text-foreground">{warningCount}</div>
           <div className={cn('text-2xs', warningCount > 0 ? 'text-yellow-400' : 'text-green-400')}>
@@ -875,13 +877,21 @@ export function HardwareHealthCard() {
         needsPagination={currentNeedsPagination}
       />
 
-      {/* Last update */}
-      {lastUpdate && (
-        <div className="text-2xs text-muted-foreground text-center mt-2 flex items-center justify-center gap-1">
-          <RefreshCw className="w-3 h-3" />
-          Updated {lastUpdate.toLocaleTimeString()}
-        </div>
-      )}
+      {/* part 4: replaced bespoke "Updated HH:MM:SS" footer with the
+          standard RefreshIndicator so it matches the rest of the card
+          deck and shows a stale-data warning past 5 minutes.
+          part 4 followup: hide the timestamp in demo mode — the cache
+          can preserve `lastUpdate` from a prior live session, which
+          would show a misleading "Updated 3h ago" against demo data. */}
+      <div className="mt-2 flex items-center justify-center">
+        <RefreshIndicator
+          isRefreshing={isRefreshing}
+          lastUpdated={isDemoFallback ? null : lastUpdate}
+          size="sm"
+          showLabel={true}
+          staleThresholdMinutes={5}
+        />
+      </div>
     </div>
   )
 }

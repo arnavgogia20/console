@@ -7,7 +7,6 @@
 
 import { useState, useEffect, useRef } from 'react'
 import {
-  X,
   Download,
   Copy,
   FileText,
@@ -20,9 +19,11 @@ import type { Resolution } from '../../hooks/useResolutions'
 import type { MissionExport, FileScanResult } from '../../lib/missions/types'
 import { fullScan } from '../../lib/missions/scanner/index'
 import { cn } from '../../lib/cn'
+import { BaseModal } from '../../lib/modals/BaseModal'
 import { UI_FEEDBACK_TIMEOUT_MS } from '../../lib/constants/network'
 import { copyToClipboard } from '../../lib/clipboard'
-import { safeRevokeObjectURL } from '../../lib/download'
+import { downloadText } from '../../lib/download'
+import { useToast } from '../ui/Toast'
 
 interface ShareMissionDialogProps {
   resolution: Resolution
@@ -100,6 +101,8 @@ function missionToMarkdown(mission: MissionExport): string {
 }
 
 export function ShareMissionDialog({ resolution, isOpen, onClose }: ShareMissionDialogProps) {
+  // #6226: useToast for download error feedback.
+  const { showToast } = useToast()
   const [scanResult, setScanResult] = useState<FileScanResult | null>(null)
   const [scanning, setScanning] = useState(false)
   const [exported, setExported] = useState<ExportChannel | null>(null)
@@ -133,15 +136,16 @@ export function ShareMissionDialog({ resolution, isOpen, onClose }: ShareMission
 
     const json = JSON.stringify(mission, null, 2)
 
+    const slug = mission.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 60)
     switch (channel) {
       case 'json': {
-        const blob = new Blob([json], { type: 'application/json' })
-        const url = URL.createObjectURL(blob)
-        const a = document.createElement('a')
-        a.href = url
-        a.download = `${mission.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 60)}.json`
-        a.click()
-        safeRevokeObjectURL(url)
+        // #6226: route through downloadText so storage-quota / blocker
+        // failures surface as a toast instead of an unhandled exception.
+        const result = downloadText(`${slug}.json`, json, 'application/json')
+        if (!result.ok) {
+          showToast(`Failed to export JSON: ${result.error?.message || 'unknown error'}`, 'error')
+          return
+        }
         break
       }
       case 'clipboard':
@@ -151,14 +155,13 @@ export function ShareMissionDialog({ resolution, isOpen, onClose }: ShareMission
         await copyToClipboard(missionToMarkdown(mission))
         break
       case 'yaml': {
+        // #6226: same downloadText wrapper for the YAML export path.
         const yamlContent = missionToYaml(mission)
-        const yamlBlob = new Blob([yamlContent], { type: 'application/x-yaml' })
-        const yamlUrl = URL.createObjectURL(yamlBlob)
-        const yamlAnchor = document.createElement('a')
-        yamlAnchor.href = yamlUrl
-        yamlAnchor.download = `${mission.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 60)}.yaml`
-        yamlAnchor.click()
-        safeRevokeObjectURL(yamlUrl)
+        const result = downloadText(`${slug}.yaml`, yamlContent, 'application/x-yaml')
+        if (!result.ok) {
+          showToast(`Failed to export YAML: ${result.error?.message || 'unknown error'}`, 'error')
+          return
+        }
         break
       }
     }
@@ -168,24 +171,13 @@ export function ShareMissionDialog({ resolution, isOpen, onClose }: ShareMission
     exportedTimeoutRef.current = setTimeout(() => setExported(null), UI_FEEDBACK_TIMEOUT_MS)
   }
 
-  if (!isOpen) return null
-
   const hasWarnings = scanResult && scanResult.findings.some(f => f.severity === 'warning' || f.severity === 'error')
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-2xl">
-      <div className="bg-card border border-border rounded-lg shadow-xl w-full max-w-md mx-4">
-        {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-border">
-          <div className="flex items-center gap-2">
-            <Shield className="w-4 h-4 text-primary" />
-            <h3 className="text-sm font-semibold text-foreground">Export Mission</h3>
-          </div>
-          <button onClick={onClose} className="text-muted-foreground hover:text-foreground transition-colors">
-            <X className="w-4 h-4" />
-          </button>
-        </div>
+    <BaseModal isOpen={isOpen} onClose={onClose} size="sm">
+      <BaseModal.Header title="Export Mission" icon={Shield} onClose={onClose} />
 
+      <BaseModal.Content noPadding>
         {/* Mission preview */}
         <div className="p-4 border-b border-border">
           <p className="text-xs font-medium text-foreground truncate">{resolution.title}</p>
@@ -250,8 +242,8 @@ export function ShareMissionDialog({ resolution, isOpen, onClose }: ShareMission
             onClick={() => handleExport('yaml')}
           />
         </div>
-      </div>
-    </div>
+      </BaseModal.Content>
+    </BaseModal>
   )
 }
 

@@ -67,9 +67,27 @@ type TokenRevoker interface {
 // TokenRevoker (typically SQLite). The cache avoids a DB query on every request
 // while the persistent store ensures revocations survive server restarts.
 //
-// Limitation: In multi-instance deployments, the in-memory cache on one instance
-// will not see tokens revoked by another instance until the next DB check (slow path).
-// For single-instance deployments (the current architecture), this is not an issue.
+// Cross-instance correctness (#5977):
+//   - Revocations are written through to the shared persistent store on
+//     every Revoke() call, so they are visible to every instance that shares
+//     the same DB as soon as the transaction commits.
+//   - IsRevoked() checks the in-memory cache first (fast path); on a cache
+//     miss it falls through to the persistent store (slow path). This means
+//     a token revoked on instance A is rejected by instance B on the next
+//     request, even if instance B has never seen that JTI before.
+//   - The backfill in the slow path caches a zero-time entry so subsequent
+//     requests for the same revoked JTI hit the fast path. The periodic
+//     cleanup loop prunes expired rows from the persistent store
+//     (CleanupExpiredTokens) and evicts stale in-memory entries: entries
+//     whose JWT expiry has passed, plus zero-time backfilled entries when
+//     the cache exceeds half its max size (those can be re-fetched from
+//     the DB slow path on demand). Authoritative expiry continues to live
+//     in the persistent store.
+//
+// Deployment requirement: every instance must point at the same persistent
+// store (same SQLite file on shared storage, or an equivalent shared backend).
+// Running multiple instances against independent stores would break the
+// cross-instance revocation guarantee.
 type revokedTokenCache struct {
 	sync.RWMutex
 	tokens map[string]time.Time // jti -> expiresAt
@@ -217,6 +235,11 @@ func IsTokenRevoked(jti string) bool {
 // Must match the name used in handlers/auth.go.
 const jwtCookieName = "kc_auth"
 
+// bearerScheme is the RFC 6750 authentication scheme prefix (with trailing
+// space) for the Authorization header. Extracted as a constant so the
+// middleware and any helpers agree on the exact prefix to strip.
+const bearerScheme = "Bearer "
+
 // JWTAuth creates JWT authentication middleware.
 // Token resolution order: Authorization header -> HttpOnly cookie -> _token query param (SSE only).
 func JWTAuth(secret string) fiber.Handler {
@@ -224,11 +247,31 @@ func JWTAuth(secret string) fiber.Handler {
 		authHeader := c.Get("Authorization")
 		var tokenString string
 
-		if authHeader != "" {
-			tokenString = strings.TrimPrefix(authHeader, "Bearer ")
-			if tokenString == authHeader {
-				slog.Info("[Auth] invalid authorization format", "path", c.Path())
-				return fiber.NewError(fiber.StatusUnauthorized, "Invalid authorization format")
+		// Parse the Authorization header. Any of the following structurally
+		// malformed inputs are treated the same as an empty header and fall
+		// through to the cookie path (#6063):
+		//   - non-empty header without the "Bearer " prefix (e.g. "garbage")
+		//   - "Bearer" with no trailing space or token
+		//   - "Bearer " with only whitespace after the scheme
+		//   - a header consisting entirely of whitespace
+		// Previously any of these returned 401 immediately, which stranded
+		// clients that had a perfectly valid kc_auth cookie (the session was
+		// live, but a broken/legacy fetch wrapper was stamping nonsense into
+		// the header). The companion #6026 path handles the different case
+		// of a structurally valid header that fails to parse.
+		trimmedHeader := strings.TrimSpace(authHeader)
+		if trimmedHeader != "" {
+			if strings.HasPrefix(trimmedHeader, bearerScheme) {
+				candidate := strings.TrimSpace(strings.TrimPrefix(trimmedHeader, bearerScheme))
+				if candidate != "" {
+					tokenString = candidate
+				}
+			}
+			// If we got here with tokenString still empty, the header was
+			// structurally malformed — keep going and let the cookie path
+			// (and the downstream "missing authorization" check) decide.
+			if tokenString == "" {
+				slog.Info("[Auth] malformed authorization header, trying cookie", "path", c.Path())
 			}
 		}
 
@@ -238,9 +281,44 @@ func JWTAuth(secret string) fiber.Handler {
 		}
 
 		// Fallback 2: accept _token query param for SSE /stream endpoints
-		// (EventSource API does not support custom headers)
+		// (EventSource API does not support custom headers, so SSE endpoints
+		// may receive the JWT as a query parameter). Preferred clients use
+		// the fetch-based SSE client which sends the token via the
+		// Authorization header; this fallback exists for legacy EventSource
+		// callers. See #5979.
 		if tokenString == "" && c.Query("_token") != "" && strings.HasSuffix(c.Path(), "/stream") {
 			tokenString = c.Query("_token")
+		}
+
+		// SECURITY: Always strip the `_token` query parameter from the
+		// request URI whenever it is present, regardless of whether it
+		// was actually consumed for authentication. A misconfigured
+		// client could send both an Authorization header AND a
+		// `?_token=...` query param on the same request; without this
+		// unconditional scrub, the JWT in the URL would survive into
+		// downstream middleware, handlers, access logs, error pages,
+		// proxy-forwarded URLs, and metrics labels — leaking the token.
+		//
+		// Scrubbing ensures:
+		//   - downstream middleware and handlers never observe it,
+		//   - any code that serializes the URL (access logs, error pages,
+		//     proxy forwarding, metrics labels) cannot leak the JWT,
+		//   - `c.OriginalURL()` and fasthttp's RequestURI reflect the
+		//     sanitized URL for the remainder of request handling.
+		// This is defense-in-depth: the top-level access logger already
+		// uses ${path} (no query string), but any future log line that
+		// prints the URL would otherwise leak the token.
+		if c.Query("_token") != "" {
+			args := c.Context().QueryArgs()
+			args.Del("_token")
+			// Rewrite the parsed URI so QueryArgs()/Query() no longer see the
+			// token, then sync the raw request URI header so OriginalURL()
+			// and RequestURI reflect the sanitized query string. Both writes
+			// are required — fasthttp caches the raw request URI on the
+			// request header separately from the parsed URI object.
+			reqURI := c.Context().Request.URI()
+			reqURI.SetQueryStringBytes(args.QueryString())
+			c.Context().Request.Header.SetRequestURIBytes(reqURI.RequestURI())
 		}
 
 		if tokenString == "" {
@@ -249,6 +327,31 @@ func JWTAuth(secret string) fiber.Handler {
 		}
 
 		token, err := ParseJWT(tokenString, secret)
+
+		// #6026 — When the Authorization header carries a stale or otherwise
+		// invalid token AND the client also presents a valid kc_auth cookie,
+		// fall back to the cookie instead of returning 401. This situation
+		// arises after a silent token refresh: the browser updates the cookie
+		// but an in-flight request (or a client that cached the old header
+		// value) may still send the old bearer token. Without the fallback
+		// the user sees spurious 401s and is bounced to login even though
+		// their session is still valid. The fallback is only engaged when
+		// the header was present (authHeader != "") and we didn't already
+		// pick up the cookie as the primary token — otherwise this collapses
+		// to the normal header or cookie path and we return the original
+		// error.
+		if err != nil && authHeader != "" {
+			cookieToken := c.Cookies(jwtCookieName)
+			if cookieToken != "" && cookieToken != tokenString {
+				cookieParsed, cookieErr := ParseJWT(cookieToken, secret)
+				if cookieErr == nil && cookieParsed.Valid {
+					slog.Info("[Auth] stale bearer header, falling back to cookie", "path", c.Path())
+					token = cookieParsed
+					err = nil
+					tokenString = cookieToken
+				}
+			}
+		}
 
 		if err != nil {
 			slog.Error("[Auth] token parse error", "path", c.Path(), "error", err)

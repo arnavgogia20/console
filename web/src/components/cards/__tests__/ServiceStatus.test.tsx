@@ -41,6 +41,7 @@ vi.mock('../CardDataContext', () => ({
 vi.mock('../../../lib/cards/cardHooks', () => ({
   useCardData: (items: unknown[], _opts: unknown) => ({
     items,
+    allFilteredItems: items,
     totalItems: (items as unknown[]).length,
     currentPage: 1,
     totalPages: 1,
@@ -111,7 +112,7 @@ describe('ServiceStatus', () => {
   describe('Empty state', () => {
     it('shows no services found when empty and no error', () => {
       render(<ServiceStatus />)
-      expect(screen.getByText('No services found')).toBeTruthy()
+      expect(screen.getByText('serviceStatus.noServices')).toBeTruthy()
     })
 
     it('shows failed message on error', async () => {
@@ -126,7 +127,7 @@ describe('ServiceStatus', () => {
         error: 'network error',
       } as never)
       render(<ServiceStatus />)
-      expect(screen.getByText('Failed to load services')).toBeTruthy()
+      expect(screen.getByText('serviceStatus.loadError')).toBeTruthy()
     })
   })
 

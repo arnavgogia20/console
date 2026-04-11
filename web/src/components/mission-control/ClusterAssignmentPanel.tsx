@@ -42,7 +42,12 @@ export function ClusterAssignmentPanel({
   aiStreaming,
   planningMission,
   installedOnCluster = new Map() }: ClusterAssignmentPanelProps) {
-  const { clusters, isLoading: clustersLoading } = useClusters()
+  // Use deduplicatedClusters so multiple kubeconfig contexts pointing at the
+  // same physical cluster (e.g. several user identities for the same
+  // OpenShift API server) collapse into a single picker entry. Using the raw
+  // `clusters` field surfaces every context, which produced rows like
+  // "Andrew.Anderson@ibm.com" repeated four times.
+  const { deduplicatedClusters: clusters, isLoading: clustersLoading } = useClusters()
   const { releases: helmReleases } = useHelmReleases()
   const [viewMode, setViewMode] = useState<ViewMode>('cards')
   const [autoAssignDone, setAutoAssignDone] = useState(false)
@@ -194,7 +199,16 @@ export function ClusterAssignmentPanel({
                       <Button
                         variant="ghost"
                         size="sm"
-                        onClick={() => setExcludedClusters((prev) => new Set([...prev, c.name]))}
+                        onClick={() => {
+                          setExcludedClusters((prev) => new Set([...prev, c.name]))
+                          // Clear any existing assignments for the excluded cluster (#5534)
+                          const existing = state.assignments.find((a) => a.clusterName === c.name)
+                          if (existing) {
+                            for (const pName of existing.projectNames) {
+                              onSetAssignment(c.name, pName, false)
+                            }
+                          }
+                        }}
                         className="!p-0.5 text-muted-foreground hover:text-destructive"
                         title="Remove from mission"
                         icon={<X className="w-3 h-3" />}

@@ -236,7 +236,7 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
         type: 'directory',
         source: 'github',
         loaded: false,
-        description: 'Production-tested Helm values from kubara-io/kubara',
+        description: isDemoMode() ? 'Demo catalog — install console locally for live data' : 'Production-tested Helm values from kubara-io/kubara',
         repoOwner: 'kubara-io',
         repoName: 'kubara' },
     ]
@@ -481,31 +481,36 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
       return matched / slugWordSet.size
     }
 
+    /** Minimum score to permanently consume the deep-link ref (#5654) */
+    const HIGH_CONFIDENCE_THRESHOLD = 0.9
+
     /** Find best-scoring mission at or above threshold in a list */
-    const findBest = (list: MissionExport[], isInstaller: boolean): MissionExport | undefined => {
+    const findBest = (list: MissionExport[], isInstaller: boolean): { match?: MissionExport; score: number } => {
       let best: MissionExport | undefined
       let bestScore = MIN_WORD_OVERLAP_RATIO
       for (const m of list) {
         const score = scoreMission(m, isInstaller)
         if (score >= bestScore) { best = m; bestScore = score }
       }
-      return best
+      return { match: best, score: bestScore }
     }
 
     // Search installers first, then fixers
-    const installerMatch = findBest(installerMissions, true)
-    if (installerMatch) {
+    const installer = findBest(installerMissions, true)
+    if (installer.match) {
       setActiveTab('installers')
-      selectCardMission(installerMatch)
-      deepLinkSlugRef.current = null // consumed
+      selectCardMission(installer.match)
+      // Only consume ref for high-confidence matches — low-confidence matches
+      // may be superseded when more missions finish loading (#5654)
+      if (installer.score >= HIGH_CONFIDENCE_THRESHOLD) deepLinkSlugRef.current = null
       return
     }
 
-    const fixerMatch = findBest(fixerMissions, false)
-    if (fixerMatch) {
+    const fixer = findBest(fixerMissions, false)
+    if (fixer.match) {
       setActiveTab('fixes')
-      selectCardMission(fixerMatch)
-      deepLinkSlugRef.current = null // consumed
+      selectCardMission(fixer.match)
+      if (fixer.score >= HIGH_CONFIDENCE_THRESHOLD) deepLinkSlugRef.current = null
       return
     }
 
@@ -629,6 +634,34 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
               source: 'github' as const,
               loaded: false,
               description: r.full_name }))
+          } else if (isDemoMode() && (nodeId === 'kubara' || nodeId.startsWith('kubara/'))) {
+            // Demo mode: static Kubara catalog (cached, no API calls)
+            if (nodeId === 'kubara') {
+              children = [
+                'kube-prometheus-stack', 'cert-manager', 'kyverno', 'kyverno-policies',
+                'argo-cd', 'external-secrets', 'loki', 'longhorn', 'metallb', 'traefik',
+              ].map(name => ({
+                id: `kubara/${name}`,
+                name,
+                path: `go-binary/templates/embedded/managed-service-catalog/helm/${name}`,
+                type: 'directory' as const,
+                source: 'github' as const,
+                repoOwner: 'kubara-io',
+                repoName: 'kubara',
+                loaded: false,
+              }))
+            } else {
+              children = ['Chart.yaml', 'values.yaml', 'templates'].map(fname => ({
+                id: `${nodeId}/${fname}`,
+                name: fname,
+                path: `${node.path}/${fname}`,
+                type: (fname === 'templates' ? 'directory' : 'file') as TreeNode['type'],
+                source: 'github' as const,
+                repoOwner: 'kubara-io',
+                repoName: 'kubara',
+                loaded: fname !== 'templates',
+              }))
+            }
           } else {
             // Specific repo node — list repo contents via GitHub Contents API
             const repoPath = node.path
@@ -704,19 +737,6 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
             )
           )
         } else if (node.source === 'github') {
-          // In demo mode, api.get() throws BackendUnavailableError — use static demo data
-          if (isDemoMode() && node.id === 'kubara') {
-            setDirectoryEntries([
-              { name: 'prometheus-stack', path: 'helm/prometheus-stack', type: 'directory' },
-              { name: 'cert-manager', path: 'helm/cert-manager', type: 'directory' },
-              { name: 'falco-runtime-security', path: 'helm/falco-runtime-security', type: 'directory' },
-              { name: 'kyverno-policies', path: 'helm/kyverno-policies', type: 'directory' },
-              { name: 'argocd-gitops', path: 'helm/argocd-gitops', type: 'directory' },
-              { name: 'istio-service-mesh', path: 'helm/istio-service-mesh', type: 'directory' },
-              { name: 'velero-backups', path: 'helm/velero-backups', type: 'directory' },
-              { name: 'external-secrets', path: 'helm/external-secrets', type: 'directory' },
-            ])
-          } else {
           // Fetch repo contents via GitHub Contents API proxy
           const owner = node.repoOwner || node.path.split('/')[0]
           const repo = node.repoName || node.path.split('/')[1]
@@ -733,7 +753,6 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
               type: e.type === 'dir' ? 'directory' as const : 'file' as const,
               size: e.size }))
           setDirectoryEntries(entries)
-          }
         } else {
           setDirectoryEntries([])
         }
@@ -753,8 +772,18 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
           )
           content = data
         } else if (node.source === 'github') {
+          // In demo mode for Kubara files, return demo content
+          if (isDemoMode() && node.id.startsWith('kubara/')) {
+            const chartName = node.id.split('/')[1] || 'chart'
+            if (node.name === 'Chart.yaml') {
+              content = `apiVersion: v2\nname: ${chartName}\ndescription: Production-tested ${chartName} Helm chart from Kubara\nversion: 1.0.0\ntype: application\nappVersion: "latest"\nmaintainers:\n  - name: kubara-io\n    url: https://github.com/kubara-io/kubara`
+            } else if (node.name === 'values.yaml') {
+              content = `# ${chartName} — Kubara production values\n# These values are tested in production environments\n# See https://github.com/kubara-io/kubara for details\n\nreplicaCount: 2\n\nresources:\n  requests:\n    cpu: 100m\n    memory: 128Mi\n  limits:\n    cpu: 500m\n    memory: 512Mi\n\nserviceAccount:\n  create: true\n\npodSecurityContext:\n  runAsNonRoot: true\n  fsGroup: 65534\n\nmonitoring:\n  enabled: true\n  serviceMonitor:\n    enabled: true`
+            } else {
+              content = `# ${node.name}\n# Kubara template file`
+            }
+          } else {
           // Fetch raw file content via GitHub Contents API proxy
-          // node.path is "owner/repo/filepath" — extract parts for the API call
           const parts = node.path.split('/')
           const owner = parts[0]
           const repo = parts[1]
@@ -772,6 +801,7 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
           } else {
             content = JSON.stringify(ghFile)
           }
+          }
         } else {
           return
         }
@@ -780,6 +810,13 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
         setRawContent(raw)
         setUnstructuredContent(null)
 
+        // External repo files (e.g., Kubara Helm charts) are not missions —
+        // show as raw YAML/content instead of trying to parse as a mission
+        if (node.repoOwner) {
+          const format = node.name.endsWith('.yaml') || node.name.endsWith('.yml') ? 'yaml' as const : 'markdown' as const
+          setUnstructuredContent({ content: raw, format, preview: { detectedTitle: node.name, detectedSections: [], detectedCommands: [], detectedYamlBlocks: 1, detectedApiGroups: [], totalLines: raw.split('\n').length }, detectedProjects: [] })
+          setSelectedMission(null)
+        } else {
         try {
           const parseResult = parseFileContent(raw, node.name)
           if (parseResult.type === 'structured') {
@@ -804,6 +841,7 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
           } catch {
             setSelectedMission(null)
           }
+        }
         }
       } catch {
         setRawContent(null)
@@ -1095,6 +1133,8 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
+        // Stop the event from reaching the sidebar's Escape handler
+        e.stopImmediatePropagation()
         if (selectedMission) {
           setSelectedMission(null)
           setRawContent(null)
@@ -1124,20 +1164,12 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
   if (!isOpen) return null
 
   return (
-    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 backdrop-blur-2xl">
+    <div className="fixed inset-0 z-modal flex items-center justify-center bg-black/60 backdrop-blur-sm">
     <div className="w-[94vw] h-[90vh] bg-background rounded-xl shadow-2xl border border-border flex flex-col overflow-hidden">
       {/* ================================================================== */}
       {/* Top bar: search + filters */}
       {/* ================================================================== */}
       <div className="flex items-center gap-3 px-4 py-3 bg-card border-b border-border">
-        <button
-          onClick={onClose}
-          className="p-2 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
-          title="Close (Esc)"
-        >
-          <X className="w-5 h-5" />
-        </button>
-
         <div className="flex-1 relative">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
           <input
@@ -1192,6 +1224,19 @@ export function MissionBrowser({ isOpen, onClose, onImport, initialMission }: Mi
             <List className="w-4 h-4" />
           </button>
         </div>
+
+        {/* #6308: close button moved to the RIGHT end of the top bar to
+            match every other modal in the app (BaseModal etc). Having
+            it on the left was a confusing one-off — users trained to
+            close modals via the top-right X were not finding it. */}
+        <button
+          onClick={onClose}
+          className="p-2 rounded-lg hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+          title="Close (Esc)"
+          aria-label="Close mission browser"
+        >
+          <X className="w-5 h-5" />
+        </button>
       </div>
 
       {/* Filter bar — constrained height on mobile with scroll */}

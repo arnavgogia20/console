@@ -25,7 +25,7 @@ import {
   Search,
   Satellite } from 'lucide-react'
 import { useSearchParams, useLocation } from 'react-router-dom'
-import { useMissions } from '../../../hooks/useMissions'
+import { useMissions, isActiveMission } from '../../../hooks/useMissions'
 import { useMobile } from '../../../hooks/useMobile'
 import { StatusBadge } from '../../ui/StatusBadge'
 import { cn } from '../../../lib/cn'
@@ -59,6 +59,12 @@ const SIDEBAR_MAX_WIDTH = 800
 const SIDEBAR_DEFAULT_WIDTH = 480
 const SIDEBAR_WIDTH_KEY = 'ksc-mission-sidebar-width'
 
+// Tablet breakpoint matches Tailwind's `lg` (1024px). Below this width the
+// mission sidebar is rendered as an overlay (position: fixed without pushing
+// main content) so tablet layouts don't get squeezed below the min sidebar
+// width. See issues 6388 / 6394.
+const TABLET_BREAKPOINT_PX = 1024
+
 function loadSavedWidth(): number {
   const maxW = typeof window !== 'undefined'
     ? Math.min(SIDEBAR_MAX_WIDTH, window.innerWidth * 0.6)
@@ -89,19 +95,37 @@ export function MissionSidebar() {
   const [isResizing, setIsResizing] = useState(false)
   const latestWidthRef = useRef(sidebarWidth)
 
+  // Track tablet range (>= mobile but < lg). In this range the sidebar is
+  // rendered as an overlay that does NOT push main content — pushing at
+  // tablet widths squeezes main below the sidebar min width and can cause
+  // ~10px content overlap (issue 6388).
+  const [isTablet, setIsTablet] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return window.innerWidth < TABLET_BREAKPOINT_PX
+  })
+  useEffect(() => {
+    const mq = window.matchMedia(`(max-width: ${TABLET_BREAKPOINT_PX - 1}px)`)
+    const onChange = (e: MediaQueryListEvent) => setIsTablet(e.matches)
+    setIsTablet(mq.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+
   // Publish sidebar width as a CSS custom property so Layout.tsx can
   // adjust main-content margins without needing context plumbing.
+  // On tablet (< 1024px) we publish 0 so the sidebar floats as an overlay.
   useEffect(() => {
     const root = document.documentElement
-    if (!isMobile && isSidebarOpen && !isSidebarMinimized && !isFullScreen) {
+    const isOverlayMode = isMobile || isTablet
+    if (!isOverlayMode && isSidebarOpen && !isSidebarMinimized && !isFullScreen) {
       root.style.setProperty('--mission-sidebar-width', `${sidebarWidth}px`)
-    } else if (!isMobile && isSidebarOpen && isSidebarMinimized && !isFullScreen) {
+    } else if (!isOverlayMode && isSidebarOpen && isSidebarMinimized && !isFullScreen) {
       root.style.setProperty('--mission-sidebar-width', '48px')
     } else {
       root.style.setProperty('--mission-sidebar-width', '0px')
     }
     return () => { root.style.removeProperty('--mission-sidebar-width') }
-  }, [isMobile, isSidebarOpen, isSidebarMinimized, isFullScreen, sidebarWidth])
+  }, [isMobile, isTablet, isSidebarOpen, isSidebarMinimized, isFullScreen, sidebarWidth])
 
   // Re-clamp sidebar width when viewport is resized
   useEffect(() => {
@@ -195,6 +219,17 @@ export function MissionSidebar() {
 
   const handleApplyResolution = (resolution: { title: string; resolution: { summary: string; steps: string[]; yaml?: string } }) => {
     if (!activeMission) return
+    // Enforce lifecycle validation (#5934): resolution should never be
+    // applied to a mission that is in a non-interactive state. Blocked
+    // missions are awaiting preflight fixes, pending missions have never
+    // left the queue, and cancelling/cancelled missions should not be
+    // restarted through the resolution flow. Running missions already
+    // have input disabled so sendMessage would no-op, but we surface a
+    // clearer guard here anyway.
+    const NON_APPLIABLE_STATUSES = new Set(['blocked', 'pending', 'cancelling', 'running'])
+    if (NON_APPLIABLE_STATUSES.has(activeMission.status)) {
+      return
+    }
     const applyMessage = `Please apply this saved resolution:\n\n**${resolution.title}**\n\n${resolution.resolution.summary}\n\nSteps:\n${resolution.resolution.steps.map((s: string, i: number) => `${i + 1}. ${s}`).join('\n')}${resolution.resolution.yaml ? `\n\nYAML:\n\`\`\`yaml\n${resolution.resolution.yaml}\n\`\`\`` : ''}`
     sendMessage(activeMission.id, applyMessage)
   }
@@ -327,13 +362,27 @@ export function MissionSidebar() {
     return m.title.toLowerCase().includes(q) || m.description.toLowerCase().includes(q)
   }
   const savedMissions = missions.filter(m => m.status === 'saved' && matchesSearch(m))
+  // #5946 — "Active" missions must exclude completed, failed, and cancelled
+  // missions. Previously this filter only excluded 'saved', which caused
+  // terminal missions to still appear under the active list and inflate the
+  // count.
   const activeMissions = missions
-    .filter(m => m.status !== 'saved' && matchesSearch(m))
+    .filter(m => isActiveMission(m) && matchesSearch(m))
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
 
   /** Paginated slice of active missions for rendering (#4778) */
   const visibleActiveMissions = activeMissions.slice(0, visibleMissionCount)
   const hasMoreMissions = activeMissions.length > visibleMissionCount
+
+  /**
+   * Total missions actually rendered in the list view (saved + active).
+   * Used so the list header count and the chat view's "Back to missions"
+   * label agree on the same source of truth (#6134, #6135, #6136, #6137).
+   * Previously the chat button used `missions.length` (which included
+   * terminal completed/failed/cancelled missions that the list filters
+   * out via isActiveMission), producing a mismatch like "21 vs 24".
+   */
+  const listTotalMissions = savedMissions.length + activeMissions.length
 
   const handleImportMission = (mission: MissionExport) => {
     const missionType = mission.missionClass === 'install' ? 'deploy' as const
@@ -442,8 +491,11 @@ export function MissionSidebar() {
   }, [isSidebarOpen, isFullScreen, setFullScreen, closeSidebar])
 
   // Count missions needing attention
+  // Blocked missions are stuck waiting on user action (preflight failure,
+  // missing credentials, RBAC denial). Surfacing them in the attention
+  // indicator ensures the user sees the required action (#5933).
   const needsAttention = missions.filter(m =>
-    m.status === 'waiting_input' || m.status === 'failed'
+    m.status === 'waiting_input' || m.status === 'failed' || m.status === 'blocked'
   ).length
 
   const runningCount = missions.filter(m => m.status === 'running').length
@@ -480,8 +532,8 @@ export function MissionSidebar() {
 
         <div className="flex flex-col items-center gap-2">
           <LogoWithStar className="w-5 h-5" />
-          {missions.length > 0 && (
-            <span className="text-xs font-medium text-foreground">{missions.length}</span>
+          {activeMissions.length > 0 && (
+            <span className="text-xs font-medium text-foreground">{activeMissions.length}</span>
           )}
           {runningCount > 0 && (
             <Loader2 className="w-4 h-4 animate-spin text-blue-400" />
@@ -501,7 +553,15 @@ export function MissionSidebar() {
       {/* Mobile backdrop */}
       {isMobile && isSidebarOpen && (
         <div
-          className="fixed inset-0 bg-black/60 backdrop-blur-2xl z-30 md:hidden"
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-overlay md:hidden"
+          onClick={closeSidebar}
+        />
+      )}
+      {/* Tablet backdrop — the sidebar renders as an overlay at < lg so main
+          content isn't squeezed. A tap-out backdrop mirrors mobile UX (issue 6388). */}
+      {!isMobile && isTablet && isSidebarOpen && !isFullScreen && (
+        <div
+          className="fixed inset-0 bg-black/40 backdrop-blur-sm z-overlay lg:hidden"
           onClick={closeSidebar}
         />
       )}
@@ -556,7 +616,9 @@ export function MissionSidebar() {
         <div className="flex items-center gap-1 min-w-0">
           {/* Optional toolbar buttons — clipped when sidebar is narrow */}
           <div className="flex items-center gap-1 overflow-hidden min-w-0 flex-shrink">
-            {/* New Mission Button */}
+            {/* New Mission Button — uses "+" for discoverability (#6095).
+                Styled with a purple accent and ring so it stands out from
+                the font-size Plus control and reads clearly as "add new". */}
             <button
               onClick={() => {
                 setShowNewMission(!showNewMission)
@@ -565,14 +627,18 @@ export function MissionSidebar() {
                 }
               }}
               className={cn(
-                "p-1.5 rounded transition-colors flex-shrink-0",
+                // mr-2 gives the accented "+ New mission" button breathing room
+                // from the adjacent toolbar group (#6132) so it doesn't visually
+                // merge with the Globe/Rocket icons next to it.
+                "p-1.5 mr-2 rounded transition-colors flex-shrink-0 ring-1",
                 showNewMission
-                  ? "bg-primary text-primary-foreground"
-                  : "text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/10"
+                  ? "bg-primary text-primary-foreground ring-primary"
+                  : "bg-purple-500/10 text-purple-400 ring-purple-500/30 hover:bg-purple-500/20 hover:text-purple-300"
               )}
-              title={t('missionSidebar.startNewMission')}
+              aria-label={t('missionSidebar.newMissionButton')}
+              title={t('missionSidebar.newMissionButton')}
             >
-              <Sparkles className="w-4 h-4" />
+              <Plus className="w-4 h-4" />
             </button>
             {/* Browse Community Missions */}
             <button
@@ -929,14 +995,20 @@ export function MissionSidebar() {
             </div>
           )}
           <div className="flex-1 flex flex-col min-h-0 min-w-0">
-            {/* Back to list if multiple missions */}
-            {missions.length > 1 && (
+            {/* Back to missions list.
+             * Always visible when an activeMission is set — this is the only
+             * UI path that clears activeMission. Previously this was gated on
+             * listTotalMissions > 1 (#6137), but that trapped users who
+             * filtered via missionSearchQuery down to a single result with
+             * no way to return to the full list (#6145). Safest fix: always
+             * show the button when activeMission != null. */}
+            {activeMission != null && (
               <button
                 onClick={() => setActiveMission(null)}
                 className="flex items-center gap-1 px-4 py-2 text-xs text-muted-foreground hover:text-foreground border-b border-border flex-shrink-0"
               >
                 <ChevronLeft className="w-3 h-3" />
-                {t('missionSidebar.backToMissions', { count: missions.length })}
+                {t('missionSidebar.backToMissions', { count: listTotalMissions })}
               </button>
             )}
             <MissionChat mission={activeMission} isFullScreen={isFullScreen} fontSize={fontSize} onToggleFullScreen={() => setFullScreen(true)} />
@@ -1119,7 +1191,7 @@ export function MissionSidebar() {
       {/* Saved Mission Detail Modal */}
       {viewingMission && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-2xl"
+          className="fixed inset-0 z-modal flex items-center justify-center bg-black/60 backdrop-blur-sm"
           onClick={(e) => { if (e.target === e.currentTarget) setViewingMission(null) }}
           onKeyDown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); setViewingMission(null) } }}
           tabIndex={-1}
@@ -1213,12 +1285,20 @@ export function MissionSidebarToggle() {
   const { missions, isSidebarOpen, openSidebar } = useMissions()
   const { isMobile } = useMobile()
 
+  // Blocked missions are stuck waiting on user action (preflight failure,
+  // missing credentials, RBAC denial). Surfacing them in the attention
+  // indicator ensures the user sees the required action (#5933).
   const needsAttention = missions.filter(m =>
-    m.status === 'waiting_input' || m.status === 'failed'
+    m.status === 'waiting_input' || m.status === 'failed' || m.status === 'blocked'
   ).length
 
   const runningCount = missions.filter(m => m.status === 'running').length
-
+  /**
+   * Active mission count — excludes saved/completed/failed/cancelled (#5947).
+   * Previously this only filtered out 'saved' missions, which caused the
+   * toggle-button badge to include terminal missions and overstate activity.
+   */
+  const activeCount = missions.filter(isActiveMission).length
 
   // Always show toggle when sidebar is closed (even with no missions)
   if (isSidebarOpen) {
@@ -1245,8 +1325,8 @@ export function MissionSidebarToggle() {
       )}
       {needsAttention > 0 ? (
         <span className={isMobile ? 'text-xs font-medium' : 'text-sm font-medium'}>{t('missionSidebar.needsAttention', { count: needsAttention })}</span>
-      ) : missions.length > 0 ? (
-        <span className={isMobile ? 'text-xs' : 'text-sm'}>{t('missionSidebar.missionCount', { count: missions.length })}</span>
+      ) : activeCount > 0 ? (
+        <span className={isMobile ? 'text-xs' : 'text-sm'}>{t('missionSidebar.missionCount', { count: activeCount })}</span>
       ) : (
         <span className={isMobile ? 'text-xs' : 'text-sm'}>{t('missionSidebar.aiMissions')}</span>
       )}

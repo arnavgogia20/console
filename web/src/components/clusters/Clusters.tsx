@@ -2,11 +2,13 @@ import { useState, useEffect } from 'react'
 import { useSearchParams, useLocation, useNavigate } from 'react-router-dom'
 import { AlertTriangle, ChevronRight, ChevronDown, Server, Scissors } from 'lucide-react'
 import { useClusters, useGPUNodes, useNVIDIAOperators, refreshSingleCluster } from '../../hooks/useMCP'
+import { agentFetch } from '../../hooks/mcp/shared'
 import { ClusterDetailModal } from './ClusterDetailModal'
 import { AddClusterDialog } from './AddClusterDialog'
 import { EmptyClusterState } from './EmptyClusterState'
 import {
   RenameModal,
+  RemoveClusterDialog,
   FilterTabs,
   ClusterGrid,
   GPUDetailModal,
@@ -18,6 +20,7 @@ import { DashboardPage } from '../../lib/dashboards/DashboardPage'
 import { getDefaultCards } from '../../config/dashboards'
 import { useLocalAgent } from '../../hooks/useLocalAgent'
 import { emitClusterStatsDrillDown } from '../../lib/analytics'
+import { ROUTES } from '../../config/routes'
 import { isInClusterMode } from '../../hooks/useBackendHealth'
 import { useDemoMode } from '../../hooks/useDemoMode'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
@@ -132,6 +135,7 @@ export function Clusters() {
     return (stored as ClusterLayoutMode) || 'grid'
   })
   const [renamingCluster, setRenamingCluster] = useState<string | null>(null)
+  const [removingCluster, setRemovingCluster] = useState<string | null>(null)
 
   // Additional UI state
   const [showClusterGrid, setShowClusterGrid] = useState(true) // Cluster cards visible by default
@@ -145,15 +149,58 @@ export function Clusters() {
 
   const handleRenameContext = async (oldName: string, newName: string) => {
     if (!isConnected) throw new Error('Local agent not connected')
-    const response = await fetch(`${LOCAL_AGENT_HTTP_URL}/rename-context`, {
+    // Use agentFetch so the Authorization: Bearer <KC_AGENT_TOKEN> header
+    // is injected — plain fetch() is rejected with 401 when the agent has
+    // a token configured (#6133).
+    const response = await agentFetch(`${LOCAL_AGENT_HTTP_URL}/rename-context`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ oldName, newName }),
       signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
     if (!response.ok) {
-      const data = await response.json().catch(() => ({})) as { message?: string }
-      throw new Error(data.message || 'Failed to rename context')
+      const data = await response.json().catch(() => ({})) as { error?: string; message?: string }
+      // Fall back to HTTP status so users see e.g. "HTTP 401: Unauthorized"
+      // instead of a silent generic error when the body has no message.
+      const fallback = `HTTP ${response.status}: ${response.statusText || 'Failed to rename context'}`
+      throw new Error(data.error || data.message || fallback)
     }
+    refetch()
+  }
+
+  /**
+   * Remove an offline cluster's kubeconfig context (#5901).
+   * Backend: `RemoveContext` in pkg/k8s/client.go (added in #5658). The agent
+   * exposes it at POST /kubeconfig/remove on the localhost-only HTTP server.
+   *
+   * Uses agentFetch() to inject the KC_AGENT_TOKEN Authorization header;
+   * without this the kc-agent rejects the request with 401 Unauthorized
+   * whenever a token is configured, which manifested as a silent "Failed
+   * to remove cluster from kubeconfig" in the UI (#6133).
+   */
+  const handleRemoveCluster = async (contextName: string) => {
+    if (!isConnected) throw new Error(t('cluster.removeClusterNoAgent'))
+    const response = await agentFetch(`${LOCAL_AGENT_HTTP_URL}/kubeconfig/remove`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ context: contextName }),
+      signal: AbortSignal.timeout(FETCH_DEFAULT_TIMEOUT_MS) })
+    if (!response.ok) {
+      // #6293: check for the 404-means-stale-agent case BEFORE attempting
+      // to parse the body. An old kc-agent returns a plain-text Go
+      // default 404 ("404 page not found") which is not JSON — reading
+      // it first would be a wasted round-trip. Same reason #6288 added
+      // the status-specific branch in the first place.
+      if (response.status === 404) {
+        throw new Error(t('cluster.removeClusterAgentTooOld'))
+      }
+      const data = await response.json().catch(() => ({})) as { error?: string; message?: string }
+      // Always surface the HTTP status if the body has no structured error,
+      // so the user sees "HTTP 401: Unauthorized" instead of the generic
+      // fallback — this was the root cause of #6133 being unactionable.
+      const fallback = `HTTP ${response.status}: ${response.statusText || t('cluster.removeClusterError')}`
+      throw new Error(data.error || data.message || fallback)
+    }
+    showToast(t('cluster.removeClusterSuccess', { name: contextName }), 'success')
     refetch()
   }
 
@@ -223,25 +270,25 @@ export function Clusters() {
         return {
           value: hasData ? stats.totalNodes : '-',
           sublabel: 'total nodes',
-          onClick: () => { emitClusterStatsDrillDown('nodes'); navigate('/compute') },
+          onClick: () => { emitClusterStatsDrillDown('nodes'); navigate(ROUTES.COMPUTE) },
           isClickable: hasData }
       case 'cpus':
         return {
           value: hasData ? stats.totalCPUs : '-',
           sublabel: 'cores allocatable',
-          onClick: () => { emitClusterStatsDrillDown('cpu'); navigate('/compute') },
+          onClick: () => { emitClusterStatsDrillDown('cpu'); navigate(ROUTES.COMPUTE) },
           isClickable: hasData }
       case 'memory':
         return {
           value: hasData ? formatMemoryStat(stats.totalMemoryGB) : '-',
           sublabel: 'allocatable',
-          onClick: () => { emitClusterStatsDrillDown('memory'); navigate('/compute') },
+          onClick: () => { emitClusterStatsDrillDown('memory'); navigate(ROUTES.COMPUTE) },
           isClickable: hasData }
       case 'storage':
         return {
           value: hasData ? formatMemoryStat(stats.totalStorageGB) : '-',
           sublabel: 'storage',
-          onClick: () => { emitClusterStatsDrillDown('storage'); navigate('/storage') },
+          onClick: () => { emitClusterStatsDrillDown('storage'); navigate(ROUTES.STORAGE) },
           isClickable: hasData }
       case 'gpus':
         return {
@@ -253,7 +300,7 @@ export function Clusters() {
         return {
           value: hasData ? stats.totalPods : '-',
           sublabel: 'running pods',
-          onClick: () => { emitClusterStatsDrillDown('pods'); navigate('/workloads') },
+          onClick: () => { emitClusterStatsDrillDown('pods'); navigate(ROUTES.WORKLOADS) },
           isClickable: hasData }
       default:
         return { value: '-', sublabel: '' }
@@ -351,6 +398,7 @@ export function Clusters() {
                   onSelectCluster={setSelectedCluster}
                   onRenameCluster={setRenamingCluster}
                   onRefreshCluster={refreshSingleCluster}
+                  onRemoveCluster={setRemovingCluster}
                   onReorder={handleReorder}
                 />
               )}
@@ -400,6 +448,11 @@ export function Clusters() {
             setSelectedCluster(null)
             setRenamingCluster(name)
           }}
+          onRemove={isConnected ? (name) => {
+            // Close the detail modal first, then open the remove confirm (#5901).
+            setSelectedCluster(null)
+            setRemovingCluster(name)
+          } : undefined}
         />
       )}
 
@@ -412,6 +465,22 @@ export function Clusters() {
           onRename={handleRenameContext}
         />
       )}
+
+      {/* Remove Offline Cluster Modal (#5901) */}
+      {removingCluster && (() => {
+        const target = clusters.find(c => c.name === removingCluster)
+        // Prefer the kubeconfig context string (what the backend expects); fall back to name
+        const ctxName = target?.context || removingCluster
+        const displayName = target?.context || target?.name || removingCluster
+        return (
+          <RemoveClusterDialog
+            contextName={ctxName}
+            displayName={displayName}
+            onClose={() => setRemovingCluster(null)}
+            onConfirm={handleRemoveCluster}
+          />
+        )
+      })()}
 
       {/* GPU Detail Modal */}
       {showGPUModal && (

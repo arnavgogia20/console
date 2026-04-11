@@ -5,6 +5,9 @@ name: Copilot Setup Steps
 
 on: workflow_dispatch
 
+# Least-privilege: read-only by default; jobs declare write scopes individually
+permissions: read-all
+
 jobs:
   copilot-setup-steps:
     runs-on: ubuntu-latest
@@ -15,10 +18,10 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # --- Node.js / Frontend ---
-      - name: Setup Node.js 20
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: web/package-lock.json
 
@@ -35,10 +38,10 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       # --- Go / Backend ---
-      - name: Setup Go 1.23
+      - name: Setup Go 1.25
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.25"
           cache-dependency-path: go.sum
 
       - name: Install C build tools (CGO for sqlite3)

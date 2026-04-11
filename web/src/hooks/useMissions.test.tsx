@@ -15,6 +15,8 @@ vi.mock('./useDemoMode', () => ({
 vi.mock('./useTokenUsage', () => ({
   addCategoryTokens: vi.fn(),
   setActiveTokenCategory: vi.fn(),
+  clearActiveTokenCategory: vi.fn(),
+  getActiveTokenCategories: vi.fn(() => []),
 }))
 
 vi.mock('./useResolutions', () => ({
@@ -274,15 +276,82 @@ describe('startMission', () => {
     expect(result.current.missions[0].status).toBe('waiting_input')
   })
 
-  it('calls emitMissionCompleted when stream done:true is received', async () => {
+  // #5936 — mission stuck in waiting_input must auto-fail after a watchdog
+  // timeout if the backend never delivers a final result message.
+  it('auto-fails mission stuck in waiting_input after watchdog timeout (#5936)', async () => {
+    vi.useFakeTimers()
+    try {
+      const { result } = renderHook(() => useMissions(), { wrapper })
+      const { requestId, missionId } = await startMissionWithConnection(result)
+
+      // Stream done but no result — mission enters waiting_input
+      act(() => {
+        MockWebSocket.lastInstance?.simulateMessage({
+          id: requestId,
+          type: 'stream',
+          payload: { content: '', done: true },
+        })
+      })
+      expect(result.current.missions.find(m => m.id === missionId)?.status).toBe('waiting_input')
+
+      // Advance past the 10-minute watchdog (WAITING_INPUT_TIMEOUT_MS = 600_000)
+      act(() => {
+        vi.advanceTimersByTime(600_000 + 1_000)
+      })
+
+      const mission = result.current.missions.find(m => m.id === missionId)
+      expect(mission?.status).toBe('failed')
+      const systemMessages = mission?.messages.filter(m => m.role === 'system') ?? []
+      expect(systemMessages.some(m => m.content.includes('No response from agent'))).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('clears waiting_input watchdog when result message arrives (#5936)', async () => {
+    vi.useFakeTimers()
+    try {
+      const { result } = renderHook(() => useMissions(), { wrapper })
+      const { requestId, missionId } = await startMissionWithConnection(result)
+
+      act(() => {
+        MockWebSocket.lastInstance?.simulateMessage({
+          id: requestId,
+          type: 'stream',
+          payload: { content: '', done: true },
+        })
+      })
+      expect(result.current.missions.find(m => m.id === missionId)?.status).toBe('waiting_input')
+
+      // Backend sends final result before the watchdog fires
+      act(() => {
+        MockWebSocket.lastInstance?.simulateMessage({
+          id: requestId,
+          type: 'result',
+          payload: { content: 'All done.' },
+        })
+      })
+      expect(result.current.missions.find(m => m.id === missionId)?.status).toBe('completed')
+
+      // Advancing past the watchdog must NOT flip the completed mission to failed
+      act(() => {
+        vi.advanceTimersByTime(600_000 + 1_000)
+      })
+      expect(result.current.missions.find(m => m.id === missionId)?.status).toBe('completed')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('calls emitMissionCompleted when result message is received', async () => {
     const { result } = renderHook(() => useMissions(), { wrapper })
     const { requestId } = await startMissionWithConnection(result)
 
     act(() => {
       MockWebSocket.lastInstance?.simulateMessage({
         id: requestId,
-        type: 'stream',
-        payload: { content: '', done: true },
+        type: 'result',
+        payload: { content: 'Task completed.' },
       })
     })
 
@@ -375,7 +444,10 @@ describe('startMission', () => {
       })
     })
 
-    expect(emitMissionError).toHaveBeenCalledWith('troubleshoot', 'test_err')
+    // #6240: emitMissionError gained an `error_detail` 3rd arg in #6235.
+    // Use expect.anything() so this assertion stays valid as the 3rd arg
+    // evolves (test exists to verify the type+code, not the message body).
+    expect(emitMissionError).toHaveBeenCalledWith('troubleshoot', 'test_err', expect.anything())
   })
 
   it('transitions mission to failed when connection cannot be established', async () => {
@@ -393,7 +465,16 @@ describe('startMission', () => {
 describe('sendMessage', () => {
   it('appends a user message to the correct mission', async () => {
     const { result } = renderHook(() => useMissions(), { wrapper })
-    const { missionId } = await startMissionWithConnection(result)
+    const { missionId, requestId } = await startMissionWithConnection(result)
+
+    // Transition to waiting_input so sendMessage is not blocked (#5478 guard)
+    act(() => {
+      MockWebSocket.lastInstance?.simulateMessage({
+        id: requestId,
+        type: 'stream',
+        payload: { content: '', done: true },
+      })
+    })
 
     act(() => {
       result.current.sendMessage(missionId, 'follow-up question')
@@ -407,7 +488,17 @@ describe('sendMessage', () => {
 
   it('sends the message payload over the WebSocket', async () => {
     const { result } = renderHook(() => useMissions(), { wrapper })
-    const { missionId } = await startMissionWithConnection(result)
+    const { missionId, requestId } = await startMissionWithConnection(result)
+
+    // Transition to waiting_input so sendMessage is not blocked (#5478 guard)
+    act(() => {
+      MockWebSocket.lastInstance?.simulateMessage({
+        id: requestId,
+        type: 'stream',
+        payload: { content: '', done: true },
+      })
+    })
+
     const beforeCallCount = MockWebSocket.lastInstance!.send.mock.calls.length
 
     await act(async () => {
@@ -468,7 +559,7 @@ describe('cancelMission', () => {
     expect(lastMsg?.content).toContain('Cancellation requested')
   })
 
-  it('transitions to failed after backend cancel_ack', async () => {
+  it('transitions to cancelled after backend cancel_ack', async () => {
     const { result } = renderHook(() => useMissions(), { wrapper })
     const { missionId } = await startMissionWithConnection(result)
 
@@ -487,12 +578,12 @@ describe('cancelMission', () => {
     })
 
     const mission = result.current.missions.find(m => m.id === missionId)
-    expect(mission?.status).toBe('failed')
+    expect(mission?.status).toBe('cancelled')
     const systemMessages = mission?.messages.filter(m => m.role === 'system') ?? []
     expect(systemMessages.some(m => m.content.includes('Mission cancelled by user.'))).toBe(true)
   })
 
-  it('transitions to failed after cancel ack timeout', async () => {
+  it('transitions to cancelled after cancel ack timeout', async () => {
     vi.useFakeTimers()
     try {
       const { result } = renderHook(() => useMissions(), { wrapper })
@@ -509,7 +600,7 @@ describe('cancelMission', () => {
       })
 
       const mission = result.current.missions.find(m => m.id === missionId)
-      expect(mission?.status).toBe('failed')
+      expect(mission?.status).toBe('cancelled')
       const systemMessages = mission?.messages.filter(m => m.role === 'system') ?? []
       expect(systemMessages.some(m => m.content.includes('backend did not confirm'))).toBe(true)
     } finally {
@@ -562,7 +653,7 @@ describe('cancelMission', () => {
     // Let the fetch promise resolve to finalize
     await act(async () => { await Promise.resolve() })
     const missionAfter = result.current.missions.find(m => m.id === missionId)
-    expect(missionAfter?.status).toBe('failed')
+    expect(missionAfter?.status).toBe('cancelled')
   })
 })
 
@@ -1092,8 +1183,7 @@ describe('localStorage quota handling', () => {
 
     // Should log the inner retry error (not silently swallow it)
     expect(errorSpy).toHaveBeenCalledWith(
-      '[Missions] localStorage still full after pruning, clearing missions',
-      expect.any(DOMException),
+      '[Missions] localStorage still full after stripping messages, clearing missions',
     )
 
     // Storage should have been cleared as a last resort
@@ -1651,7 +1741,7 @@ describe('cancelling mission receives terminal messages', () => {
     })
 
     const mission = result.current.missions.find(m => m.id === missionId)
-    expect(mission?.status).toBe('failed')
+    expect(mission?.status).toBe('cancelled')
     expect(mission?.messages.some(m => m.content.includes('cancelled by user'))).toBe(true)
   })
 
@@ -1670,7 +1760,7 @@ describe('cancelling mission receives terminal messages', () => {
       })
     })
 
-    expect(result.current.missions.find(m => m.id === missionId)?.status).toBe('failed')
+    expect(result.current.missions.find(m => m.id === missionId)?.status).toBe('cancelled')
   })
 
   it('finalizes cancellation on cancel_confirmed while cancelling', async () => {
@@ -1688,7 +1778,7 @@ describe('cancelling mission receives terminal messages', () => {
       })
     })
 
-    expect(result.current.missions.find(m => m.id === missionId)?.status).toBe('failed')
+    expect(result.current.missions.find(m => m.id === missionId)?.status).toBe('cancelled')
   })
 
   it('ignores non-terminal messages while cancelling (e.g., progress)', async () => {
@@ -1724,7 +1814,7 @@ describe('cancelling mission receives terminal messages', () => {
     })
 
     const mission = result.current.missions.find(m => m.id === missionId)
-    expect(mission?.status).toBe('failed')
+    expect(mission?.status).toBe('cancelled')
     expect(mission?.messages.some(m => m.content.includes('Cancel failed on backend'))).toBe(true)
   })
 
@@ -1742,7 +1832,7 @@ describe('cancelling mission receives terminal messages', () => {
       })
     })
 
-    expect(result.current.missions.find(m => m.id === missionId)?.status).toBe('failed')
+    expect(result.current.missions.find(m => m.id === missionId)?.status).toBe('cancelled')
   })
 
   it('prevents double-cancel (no duplicate timeout)', async () => {
@@ -1765,7 +1855,7 @@ describe('cancelling mission receives terminal messages', () => {
 
     await act(async () => { await Promise.resolve() })
     const mission = result.current.missions.find(m => m.id === missionId)
-    expect(mission?.status).toBe('failed')
+    expect(mission?.status).toBe('cancelled')
     expect(mission?.messages.some(m => m.content.includes('cancellation failed'))).toBe(true)
   })
 
@@ -1778,7 +1868,7 @@ describe('cancelling mission receives terminal messages', () => {
 
     await act(async () => { await Promise.resolve() })
     const mission = result.current.missions.find(m => m.id === missionId)
-    expect(mission?.status).toBe('failed')
+    expect(mission?.status).toBe('cancelled')
     expect(mission?.messages.some(m => m.content.includes('backend unreachable'))).toBe(true)
   })
 })
@@ -2122,23 +2212,24 @@ describe('preflight check', () => {
     expect(mission.status).toBe('blocked')
     expect(mission.preflightError?.code).toBe('MISSING_CREDENTIALS')
     expect(mission.messages.some(m => m.content.includes('Preflight Check Failed'))).toBe(true)
-    expect(emitMissionError).toHaveBeenCalledWith('deploy', 'MISSING_CREDENTIALS')
+    expect(emitMissionError).toHaveBeenCalledWith('deploy', 'MISSING_CREDENTIALS', expect.anything())
   })
 
-  it('proceeds when preflight throws unexpectedly', async () => {
+  it('blocks mission when preflight throws unexpectedly (#5846)', async () => {
     const { runPreflightCheck } = await import('../lib/missions/preflightCheck')
     vi.mocked(runPreflightCheck).mockRejectedValueOnce(new Error('Preflight crash'))
 
     const { result } = renderHook(() => useMissions(), { wrapper })
+    let missionId = ''
     act(() => {
-      result.current.startMission({ ...defaultParams, cluster: 'my-cluster', type: 'repair' })
+      missionId = result.current.startMission({ ...defaultParams, cluster: 'my-cluster', type: 'repair' })
     })
     await act(async () => { await Promise.resolve() })
     await act(async () => { await Promise.resolve() })
 
-    // Should proceed to ensureConnection (not blocked)
-    // WS will be created
-    expect(MockWebSocket.lastInstance).not.toBeNull()
+    // Should be blocked (fail-closed) — not proceed to WS connection (#5846)
+    const mission = result.current.missions.find(m => m.id === missionId)
+    expect(mission?.status).toBe('blocked')
   })
 
   it('retryPreflight transitions blocked mission back to pending', async () => {
@@ -2325,7 +2416,7 @@ describe('mission timeout interval', () => {
       const mission = result.current.missions.find(m => m.id === missionId)
       expect(mission?.status).toBe('failed')
       expect(mission?.messages.some(m => m.content.includes('Mission Timed Out'))).toBe(true)
-      expect(emitMissionError).toHaveBeenCalledWith('troubleshoot', 'mission_timeout')
+      expect(emitMissionError).toHaveBeenCalledWith('troubleshoot', 'mission_timeout', expect.anything())
     } finally {
       vi.useRealTimers()
     }
@@ -2352,7 +2443,7 @@ describe('mission timeout interval', () => {
       const mission = result.current.missions.find(m => m.id === missionId)
       expect(mission?.status).toBe('failed')
       expect(mission?.messages.some(m => m.content.includes('Agent Not Responding'))).toBe(true)
-      expect(emitMissionError).toHaveBeenCalledWith('troubleshoot', 'mission_inactivity')
+      expect(emitMissionError).toHaveBeenCalledWith('troubleshoot', 'mission_inactivity', expect.anything())
     } finally {
       vi.useRealTimers()
     }
@@ -2472,18 +2563,20 @@ describe('ensureConnection timeout', () => {
 // ── WebSocket close fails pending missions ───────────────────────────────────
 
 describe('WS close fails pending running missions', () => {
-  it('fails all pending running missions when WS closes with error content', async () => {
+  it('keeps missions running with needsReconnect flag on transient WS close (#5929)', async () => {
     const { result } = renderHook(() => useMissions(), { wrapper })
     const { missionId } = await startMissionWithConnection(result)
     expect(result.current.missions.find(m => m.id === missionId)?.status).toBe('running')
 
-    // Simulate WebSocket closing
+    // Simulate WebSocket closing — transient disconnect, reconnect attempts still available
     act(() => { MockWebSocket.lastInstance?.simulateClose() })
 
     const mission = result.current.missions.find(m => m.id === missionId)
-    expect(mission?.status).toBe('failed')
-    const systemMsg = mission?.messages.find(m => m.role === 'system')
-    expect(systemMsg?.content).toContain('Local Agent Not Connected')
+    // Mission should remain running with needsReconnect flag set,
+    // not be failed (#5929 — transient disconnect shouldn't fail missions)
+    expect(mission?.status).toBe('running')
+    expect(mission?.context?.needsReconnect).toBe(true)
+    expect(mission?.currentStep).toBe('Reconnecting...')
   })
 })
 
@@ -2713,10 +2806,10 @@ describe('sendMessage connection failure path', () => {
   })
 })
 
-// ── retryPreflight unexpected throw proceeds to execute ──────────────────────
+// ── retryPreflight unexpected throw re-blocks (fail-closed) ─────────────────
 
 describe('retryPreflight unexpected failure', () => {
-  it('proceeds to executeMission when retryPreflight throws unexpectedly', async () => {
+  it('re-blocks mission when retryPreflight throws unexpectedly (#5851)', async () => {
     const { runPreflightCheck } = await import('../lib/missions/preflightCheck')
     // First call: fail normally to create a blocked mission
     vi.mocked(runPreflightCheck).mockResolvedValueOnce({
@@ -2741,8 +2834,10 @@ describe('retryPreflight unexpected failure', () => {
     await act(async () => { await Promise.resolve() })
     await act(async () => { await Promise.resolve() })
 
-    // Should have tried to execute (creates a WebSocket)
-    expect(MockWebSocket.lastInstance).not.toBeNull()
+    // Should be re-blocked (fail-closed), not proceed to execution (#5851)
+    expect(result.current.missions.find(m => m.id === missionId)?.status).toBe('blocked')
+    // No WebSocket should have been created — execution was blocked (#5865)
+    expect(MockWebSocket.lastInstance).toBeNull()
   })
 })
 
@@ -2788,10 +2883,10 @@ describe('token usage tracking', () => {
     expect(addCategoryTokens).toHaveBeenCalledWith(75, 'missions')
   })
 
-  it('calls setActiveTokenCategory when stream completes with usage', async () => {
-    const { setActiveTokenCategory } = await import('./useTokenUsage')
+  it('calls clearActiveTokenCategory when stream completes with usage', async () => {
+    const { clearActiveTokenCategory } = await import('./useTokenUsage')
     const { result } = renderHook(() => useMissions(), { wrapper })
-    const { requestId } = await startMissionWithConnection(result)
+    const { missionId, requestId } = await startMissionWithConnection(result)
 
     act(() => {
       MockWebSocket.lastInstance?.simulateMessage({
@@ -2801,8 +2896,8 @@ describe('token usage tracking', () => {
       })
     })
 
-    // Should clear active token category
-    expect(setActiveTokenCategory).toHaveBeenCalledWith(null)
+    // Should clear active token category for this specific mission (#6016)
+    expect(clearActiveTokenCategory).toHaveBeenCalledWith(missionId)
   })
 
   it('tracks token delta on stream-done with usage', async () => {
@@ -3243,7 +3338,10 @@ describe('error classification edge cases', () => {
     const mission = result.current.missions[0]
     expect(mission.status).toBe('failed')
     expect(mission.messages.some(m => m.content.includes('Unknown error'))).toBe(true)
-    expect(emitMissionError).toHaveBeenCalledWith('troubleshoot', 'unknown')
+    // The "missing message" path explicitly passes `undefined` as the
+    // 3rd arg — toHaveBeenCalledWith requires an exact match for that
+    // arg, and expect.anything() does NOT match undefined.
+    expect(emitMissionError).toHaveBeenCalledWith('troubleshoot', 'unknown', undefined)
   })
 })
 
@@ -3559,6 +3657,12 @@ describe('WebSocket auto-reconnect backoff arithmetic', () => {
   })
 
   it('resets backoff attempts on successful connection', async () => {
+    // #6375 / #6407 — The backoff counter is no longer reset on transport
+    // `onopen`. It's only reset once the first real application-layer frame
+    // arrives (see `connectionEstablished` ref + reset in
+    // `handleAgentMessage`). This test proves the connection works by
+    // delivering an `agents_list` frame before the second close, which is
+    // the cheapest app-level message to simulate.
     vi.useFakeTimers()
     try {
       const { result } = renderHook(() => useMissions(), { wrapper })
@@ -3569,9 +3673,19 @@ describe('WebSocket auto-reconnect backoff arithmetic', () => {
       act(() => { MockWebSocket.lastInstance?.simulateClose() })
       act(() => { vi.advanceTimersByTime(1_100) })
 
-      // Second connect succeeds -> should reset counter
+      // Second connect succeeds -> should reset counter, but ONLY after an
+      // application-layer frame arrives (not merely on `onopen`).
       const ws2 = MockWebSocket.lastInstance
       await act(async () => { ws2?.simulateOpen() })
+      // Deliver a real app-level frame — this is what now triggers the
+      // backoff reset per the #6375 fix.
+      act(() => {
+        ws2?.simulateMessage({
+          id: 'test-agents-list',
+          type: 'agents_list',
+          payload: { agents: [], defaultAgent: null },
+        })
+      })
 
       // Close again -> delay should be back to 1000ms (not 4000ms)
       act(() => { ws2?.simulateClose() })
@@ -3777,7 +3891,7 @@ describe('status step transitions during mission execution', () => {
 // ── emitMissionCompleted on stream done vs result ───────────────────────────
 
 describe('analytics: emitMissionCompleted timing', () => {
-  it('emits completion analytics on stream done when mission is running', async () => {
+  it('emits completion analytics on result message when mission is running', async () => {
     vi.mocked(emitMissionCompleted).mockClear()
 
     const { result } = renderHook(() => useMissions(), { wrapper })
@@ -3786,8 +3900,8 @@ describe('analytics: emitMissionCompleted timing', () => {
     act(() => {
       MockWebSocket.lastInstance?.simulateMessage({
         id: requestId,
-        type: 'stream',
-        payload: { content: '', done: true },
+        type: 'result',
+        payload: { content: 'All done' },
       })
     })
 
@@ -3997,7 +4111,7 @@ describe('setActiveTokenCategory on mission actions', () => {
     await act(async () => { await Promise.resolve() })
     await act(async () => { MockWebSocket.lastInstance?.simulateOpen() })
 
-    expect(setActiveTokenCategory).toHaveBeenCalledWith('missions')
+    expect(setActiveTokenCategory).toHaveBeenCalledWith(expect.any(String), 'missions')
   })
 
   it('sets active token category to "missions" on sendMessage', async () => {
@@ -4019,15 +4133,16 @@ describe('setActiveTokenCategory on mission actions', () => {
       result.current.sendMessage(missionId, 'follow up')
     })
 
-    expect(setActiveTokenCategory).toHaveBeenCalledWith('missions')
+    // Per-operation tracking keyed by missionId (#6016)
+    expect(setActiveTokenCategory).toHaveBeenCalledWith(missionId, 'missions')
   })
 
   it('clears active token category on result message', async () => {
-    const { setActiveTokenCategory } = await import('./useTokenUsage')
-    vi.mocked(setActiveTokenCategory).mockClear()
+    const { clearActiveTokenCategory } = await import('./useTokenUsage')
+    vi.mocked(clearActiveTokenCategory).mockClear()
 
     const { result } = renderHook(() => useMissions(), { wrapper })
-    const { requestId } = await startMissionWithConnection(result)
+    const { missionId, requestId } = await startMissionWithConnection(result)
 
     act(() => {
       MockWebSocket.lastInstance?.simulateMessage({
@@ -4037,7 +4152,8 @@ describe('setActiveTokenCategory on mission actions', () => {
       })
     })
 
-    expect(setActiveTokenCategory).toHaveBeenCalledWith(null)
+    // Per-operation clear keyed by missionId (#6016)
+    expect(clearActiveTokenCategory).toHaveBeenCalledWith(missionId)
   })
 })
 
@@ -4344,7 +4460,7 @@ describe('cancel_ack failure path', () => {
     })
 
     const mission = result.current.missions.find(m => m.id === missionId)
-    expect(mission?.status).toBe('failed')
+    expect(mission?.status).toBe('cancelled')
     expect(mission?.messages.some(m => m.content.includes('Could not cancel'))).toBe(true)
   })
 })
@@ -4458,7 +4574,7 @@ describe('loadMissions: status preservation', () => {
     expect(mission?.currentStep).toBeUndefined()
   })
 
-  it('preserves pending missions without modification', () => {
+  it('fails pending missions on reload with recovery message (#5931)', () => {
     const pendingMission = {
       id: 'pending-1',
       title: 'Pending',
@@ -4473,7 +4589,11 @@ describe('loadMissions: status preservation', () => {
 
     const { result } = renderHook(() => useMissions(), { wrapper })
     const mission = result.current.missions.find(m => m.id === 'pending-1')
-    expect(mission?.status).toBe('pending')
+    // Pending missions cannot be resumed (backend never received the request),
+    // so they're failed on reload with a clear message (#5931).
+    expect(mission?.status).toBe('failed')
+    const systemMsg = mission?.messages.find(m => m.role === 'system')
+    expect(systemMsg?.content).toContain('Page was reloaded')
   })
 
   it('preserves saved (library) missions without modification', () => {
@@ -5352,17 +5472,18 @@ describe('unread tracking: active mission not marked unread', () => {
 // ── WebSocket close: fails pending missions, clears pendingRequests ─────────
 
 describe('WS close: pending request cleanup', () => {
-  it('clears all pending requests when WS closes', async () => {
+  it('clears all pending requests when WS closes and marks mission for reconnect (#5929)', async () => {
     const { result } = renderHook(() => useMissions(), { wrapper })
     const { missionId } = await startMissionWithConnection(result)
     expect(result.current.missions.find(m => m.id === missionId)?.status).toBe('running')
 
-    // Close WS
+    // Close WS — transient disconnect, should not fail the mission
     act(() => { MockWebSocket.lastInstance?.simulateClose() })
 
-    // Mission should have been failed
+    // Mission should still be running with needsReconnect flag (#5929)
     const mission = result.current.missions.find(m => m.id === missionId)
-    expect(mission?.status).toBe('failed')
+    expect(mission?.status).toBe('running')
+    expect(mission?.context?.needsReconnect).toBe(true)
 
     // New messages to the old request ID should be ignored (pending was cleared)
     // (This verifies pendingRequests.current.clear() was called)
@@ -5372,17 +5493,21 @@ describe('WS close: pending request cleanup', () => {
 // ── Timeout interval: does not change non-running missions ──────────────────
 
 describe('timeout interval: preserves non-running missions', () => {
-  it('does not fail pending missions when timeout fires', async () => {
+  it('does not fail waiting_input missions when timeout fires', async () => {
+    // Previously this test used `pending`, but pending missions are now
+    // auto-failed on hydration (#5931) since they cannot be resumed. The
+    // intent of this test is to verify the timeout interval only targets
+    // running missions — waiting_input is the equivalent non-running state.
     vi.useFakeTimers()
     try {
-      seedMission({ id: 'pending-safe', status: 'pending' })
+      seedMission({ id: 'waiting-safe-2', status: 'waiting_input' })
       const { result } = renderHook(() => useMissions(), { wrapper })
 
       // Advance past timeout + check interval
       act(() => { vi.advanceTimersByTime(315_000) })
 
-      const mission = result.current.missions.find(m => m.id === 'pending-safe')
-      expect(mission?.status).toBe('pending')
+      const mission = result.current.missions.find(m => m.id === 'waiting-safe-2')
+      expect(mission?.status).toBe('waiting_input')
     } finally {
       vi.useRealTimers()
     }

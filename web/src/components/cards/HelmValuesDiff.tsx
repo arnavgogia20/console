@@ -7,6 +7,7 @@ import { useDrillDownActions } from '../../hooks/useDrillDown'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { Skeleton } from '../ui/Skeleton'
 import { ClusterBadge } from '../ui/ClusterBadge'
+import { RefreshIndicator } from '../ui/RefreshIndicator'
 import { useCardData, commonComparators } from '../../lib/cards/cardHooks'
 import { CardSearchInput, CardControlsRow, CardPaginationFooter } from '../../lib/cards/CardComponents'
 import { useCardLoadingState } from './CardDataContext'
@@ -54,7 +55,12 @@ const SORT_OPTIONS = [
 
 export function HelmValuesDiff({ config }: HelmValuesDiffProps) {
   const { t } = useTranslation()
-  const { deduplicatedClusters: allClusters, isLoading: clustersLoading, isRefreshing: clustersRefreshing, isFailed: clustersFailed, consecutiveFailures: clustersFailures } = useClusters()
+  const { deduplicatedClusters: allClusters, isLoading: clustersLoading, isRefreshing: clustersRefreshing, isFailed: clustersFailed, consecutiveFailures: clustersFailures, lastRefresh: clustersLastRefreshDate } = useClusters()
+  // #6271: useClusters returns Date|null; normalize to numeric epoch
+  // so it merges cleanly with the numeric `lastRefresh` from useCache.
+  const clustersLastRefresh: number | null = clustersLastRefreshDate instanceof Date
+    ? clustersLastRefreshDate.getTime()
+    : (typeof clustersLastRefreshDate === 'number' ? clustersLastRefreshDate : null)
   const [selectedCluster, setSelectedCluster] = useState<string>(config?.cluster || '')
   const [selectedRelease, setSelectedRelease] = useState<string>(config?.release || '')
   const { drillToHelm } = useDrillDownActions()
@@ -127,7 +133,7 @@ export function HelmValuesDiff({ config }: HelmValuesDiffProps) {
   }, [globalSelectedClusters, isAllClustersSelected])
 
   // Fetch ALL Helm releases from all clusters once (not per-cluster)
-  const { releases: allHelmReleases, isLoading: releasesLoading, isRefreshing: releasesRefreshing, isDemoFallback: isDemoData } = useCachedHelmReleases()
+  const { releases: allHelmReleases, isLoading: releasesLoading, isRefreshing: releasesRefreshing, isDemoFallback: isDemoData, lastRefresh: releasesLastRefresh } = useCachedHelmReleases()
 
   // Auto-select first cluster and release in demo mode
   useEffect(() => {
@@ -158,7 +164,8 @@ export function HelmValuesDiff({ config }: HelmValuesDiffProps) {
   const {
     values,
     isLoading: valuesLoading,
-    isRefreshing: valuesRefreshing } = useCachedHelmValues(
+    isRefreshing: valuesRefreshing,
+    lastRefresh: valuesLastRefresh } = useCachedHelmValues(
     selectedCluster || undefined,
     selectedRelease || undefined,
     selectedReleaseNamespace
@@ -290,6 +297,23 @@ export function HelmValuesDiff({ config }: HelmValuesDiffProps) {
           <span className="text-sm font-medium text-muted-foreground">
             {totalItems} values
           </span>
+          {/* part 5: freshness indicator.
+              #6265: card composes data from THREE caches (clusters,
+              releases, values), so the indicator must reflect the OLDEST
+              of the three timestamps — not just releases. Hide entirely
+              in demo mode (useCache may preserve stale lastRefresh from
+              a prior live session). */}
+          <RefreshIndicator
+            isRefreshing={clustersRefreshing || releasesRefreshing || valuesRefreshing}
+            lastUpdated={(() => {
+              if (isDemoData) return null
+              const ts = [clustersLastRefresh, releasesLastRefresh, valuesLastRefresh].filter((t): t is number => typeof t === 'number')
+              return ts.length > 0 ? new Date(Math.min(...ts)) : null
+            })()}
+            size="sm"
+            showLabel={true}
+            staleThresholdMinutes={5}
+          />
         </div>
         <div className="flex items-center gap-2">
           {/* Cluster count indicator */}

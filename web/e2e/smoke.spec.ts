@@ -1,4 +1,5 @@
-import { test, expect, Page, ConsoleMessage } from '@playwright/test'
+import { test, expect, Page } from '@playwright/test'
+import { setupErrorCollector, EXPECTED_ERROR_PATTERNS } from './helpers/setup'
 
 /**
  * Smoke Tests for KubeStellar Console
@@ -8,48 +9,6 @@ import { test, expect, Page, ConsoleMessage } from '@playwright/test'
  *
  * Run with: npx playwright test e2e/smoke.spec.ts
  */
-
-// Expected console errors that should be ignored (demo mode, expected warnings, etc.)
-const EXPECTED_ERROR_PATTERNS = [
-  /Failed to fetch/i, // Network errors in demo mode
-  /WebSocket/i, // WebSocket not available in tests
-  /can't establish a connection/i, // Firefox WebSocket connection errors
-  /ResizeObserver/i, // ResizeObserver loop warnings
-  /validateDOMNesting/i, // Already tracked by Auto-QA DOM errors check
-  /act\(\)/i, // React testing warnings
-  /Cannot read.*undefined/i, // May occur during lazy loading
-  /ChunkLoadError/i, // Expected during code splitting
-  /Loading chunk/i, // Expected during lazy loading
-  /demo-token/i, // Demo mode messages
-  /localhost:8585/i, // Agent connection attempts in demo mode
-  /127\.0\.0\.1:8585/i, // Agent connection attempts (IP form)
-  /Cross-Origin Request Blocked/i, // CORS errors when backend/agent not running
-  /Notification permission/i, // Firefox blocks notification requests outside user gestures
-]
-
-function isExpectedError(message: string): boolean {
-  return EXPECTED_ERROR_PATTERNS.some(pattern => pattern.test(message))
-}
-
-/**
- * Collects console errors during page navigation
- */
-function setupErrorCollector(page: Page): { errors: string[]; warnings: string[] } {
-  const errors: string[] = []
-  const warnings: string[] = []
-
-  page.on('console', (msg: ConsoleMessage) => {
-    const text = msg.text()
-    if (msg.type() === 'error' && !isExpectedError(text)) {
-      errors.push(text)
-    }
-    if (msg.type() === 'warning' && !isExpectedError(text)) {
-      warnings.push(text)
-    }
-  })
-
-  return { errors, warnings }
-}
 
 /**
  * Sets up demo mode for testing
@@ -213,6 +172,44 @@ test.describe('Smoke Tests', () => {
       const pageContent = await page.textContent('body')
       expect(pageContent?.length).toBeGreaterThan(50)
       expect(errors).toHaveLength(0)
+    })
+  })
+
+  test.describe('Mobile Viewport', () => {
+    const MOBILE_VIEWPORT = { width: 393, height: 852 }
+
+    test('dashboard loads without error on mobile', async ({ page }) => {
+      await page.setViewportSize(MOBILE_VIEWPORT)
+      await setupDemoMode(page)
+      const { errors } = setupErrorCollector(page)
+
+      await page.goto('/')
+      await page.waitForLoadState('networkidle', { timeout: 15000 })
+
+      // Check no error boundary rendered (React #185 crash)
+      const errorBoundary = page.locator('text=This page encountered an error')
+      await expect(errorBoundary).not.toBeVisible({ timeout: 5000 })
+
+      // Page should have real content, not just an error
+      await expect(page.locator('body')).toBeVisible()
+      const bodyText = await page.textContent('body')
+      expect(bodyText?.length).toBeGreaterThan(100)
+
+      if (errors.length > 0) {
+        console.log('Mobile console errors:', errors)
+      }
+      expect(errors, 'Unexpected console errors on mobile dashboard').toHaveLength(0)
+    })
+
+    test('clusters page loads without error on mobile', async ({ page }) => {
+      await page.setViewportSize(MOBILE_VIEWPORT)
+      await setupDemoMode(page)
+
+      await page.goto('/clusters')
+      await page.waitForLoadState('networkidle', { timeout: 15000 })
+
+      const errorBoundary = page.locator('text=This page encountered an error')
+      await expect(errorBoundary).not.toBeVisible({ timeout: 5000 })
     })
   })
 

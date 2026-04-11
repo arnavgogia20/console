@@ -16,14 +16,18 @@ import { useTranslation } from 'react-i18next'
 
 const COMPUTE_CARDS_KEY = 'kubestellar-compute-cards'
 
-// Ensure new virtualization cards are present in existing saved layouts
+// Ensure new virtualization cards are present in existing saved layouts.
+// IMPORTANT: Use `card_type` (snake_case) to match the DashboardCard interface.
+// Previously this used `cardType` which caused card.card_type to be undefined,
+// crashing formatCardTitle() with "cardType is undefined" when clicking the
+// "nodes" stat block from the My Clusters dashboard (issue #5902).
 ensureCardInDashboard(COMPUTE_CARDS_KEY, 'vcluster_status', {
   id: 'compute-6',
-  cardType: 'vcluster_status',
+  card_type: 'vcluster_status',
   position: { w: 6, h: 3, x: 0, y: 6 } })
 ensureCardInDashboard(COMPUTE_CARDS_KEY, 'kubevirt_status', {
   id: 'compute-7',
-  cardType: 'kubevirt_status',
+  card_type: 'kubevirt_status',
   position: { w: 6, h: 3, x: 6, y: 6 } })
 
 // Default cards for the compute dashboard
@@ -57,10 +61,12 @@ export function Compute() {
     }
   }, [searchParams, setSearchParams, location.pathname])
 
-  // Trigger refresh when navigating to this page (location.key changes on each navigation)
+  // Trigger refresh only when navigating TO this page (not on every navigation event)
   useEffect(() => {
-    refetch()
-  }, [location.key]) // eslint-disable-line react-hooks/exhaustive-deps
+    if (location.pathname === '/compute') {
+      refetch()
+    }
+  }, [location.key, location.pathname]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Filter clusters based on global selection
   const filteredClusters = clusters.filter(c =>
@@ -79,9 +85,14 @@ export function Compute() {
       .filter(node => isAllClustersSelected || globalSelectedClusters.includes(node.cluster.split('/')[0]))
       .reduce((sum, node) => sum + node.gpuCount, 0) }
 
-  // Check if we have any reachable clusters with actual data (not refreshing)
+  // Check if we have any reachable clusters with actual data (not refreshing).
+  // A cluster counts as "has data" as soon as nodeCount has been reported —
+  // even if the reported value is 0. Previously, valid zero-node clusters were
+  // treated as "no data" and rendered as '-' (issue #6106). Zero nodes is a
+  // meaningful value (e.g. a newly-provisioned cluster before any worker is
+  // attached), not a missing one.
   const hasActualData = filteredClusters.some(c =>
-    c.reachable !== false && c.nodeCount !== undefined && c.nodeCount > 0
+    c.reachable !== false && c.nodeCount !== undefined
   )
 
   // Cache the last known good stats to show during refresh
@@ -172,7 +183,7 @@ export function Compute() {
 
   const handleCompare = () => {
     if (selectedForComparison.length >= 2) {
-      navigate(`${ROUTES.COMPUTE_COMPARE}?clusters=${selectedForComparison.join(',')}`)
+      navigate(`${ROUTES.COMPUTE_COMPARE}?clusters=${selectedForComparison.map(encodeURIComponent).join(',')}`)
     }
   }
 

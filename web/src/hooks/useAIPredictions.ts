@@ -6,7 +6,7 @@ import type {
 import { getPredictionSettings, getSettingsForBackend } from './usePredictionSettings'
 import { getDemoMode } from './useDemoMode'
 import { isAgentUnavailable, reportAgentDataSuccess, reportAgentDataError } from './useLocalAgent'
-import { setActiveTokenCategory } from './useTokenUsage'
+import { setActiveTokenCategory, clearActiveTokenCategory } from './useTokenUsage'
 import { fullFetchClusters, clusterCache } from './mcp/shared'
 
 import { LOCAL_AGENT_WS_URL, LOCAL_AGENT_HTTP_URL } from '../lib/constants'
@@ -92,6 +92,14 @@ async function fetchAIPredictions(): Promise<void> {
   }
 
   if (isAgentUnavailable()) {
+    // Agent is known to be unavailable — mark existing predictions as stale so
+    // the UI stops presenting them as fresh (#5937). Also notify subscribers so
+    // the UI re-renders immediately instead of waiting for the next poll cycle
+    // (#5938).
+    if (!isStale) {
+      isStale = true
+      notifySubscribers()
+    }
     return
   }
 
@@ -122,14 +130,21 @@ async function fetchAIPredictions(): Promise<void> {
       isStale = true
       notifySubscribers()
     } else {
+      // Non-OK response (5xx, 401, etc.) — report failure, mark stale, and
+      // notify subscribers so the UI reflects the error state (#5937, #5938).
       reportAgentDataError('/predictions/ai', `HTTP ${response.status}`)
+      isStale = true
+      notifySubscribers()
     }
   } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') {
-      // Timeout, agent likely unavailable
-    }
-    // Don't clear predictions on error, keep stale data
+    // Network error, timeout, or AbortError — backend is unreachable. Mark
+    // predictions stale and notify subscribers so the UI updates immediately
+    // rather than continuing to show data as if it were fresh (#5937, #5938).
+    // Existing prediction data is intentionally preserved (not cleared) so
+    // users can still see the last known state, clearly labeled as stale.
+    reportAgentDataError('/predictions/ai', error instanceof Error ? error.message : 'fetch_failed')
     isStale = true
+    notifySubscribers()
   }
 }
 
@@ -308,8 +323,17 @@ export function useAIPredictions() {
 
   // Trigger analysis
   const analyze = async (specificProviders?: string[]) => {
+    // Generate a stable opId for the lifetime of this analyze call so
+    // concurrent analyze() invocations (e.g. from different providers)
+    // get independent token attribution (#6016). Fall back to a
+    // timestamp-based id when crypto.randomUUID is unavailable (non-secure
+    // contexts such as plain-http dev servers).
+    const opId: string =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `predictions-${Date.now()}-${Math.random().toString(36).slice(2)}`
     setIsAnalyzing(true)
-    setActiveTokenCategory('predictions')
+    setActiveTokenCategory(opId, 'predictions')
     try {
       await triggerAnalysis(specificProviders)
       // Wait a bit then fetch results
@@ -317,7 +341,7 @@ export function useAIPredictions() {
       await fetchAIPredictions()
     } finally {
       setIsAnalyzing(false)
-      setActiveTokenCategory(null)
+      clearActiveTokenCategory(opId)
     }
   }
 

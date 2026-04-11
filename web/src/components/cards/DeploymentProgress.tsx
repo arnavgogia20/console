@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { CheckCircle, Clock, XCircle, Loader2, Filter, ChevronRight, Server } from 'lucide-react'
 import { useCachedDeployments } from '../../hooks/useCachedData'
 import { ClusterBadge } from '../ui/ClusterBadge'
+import { RefreshIndicator } from '../ui/RefreshIndicator'
 import { CardClusterFilter, CardSearchInput } from '../../lib/cards/CardComponents'
 import { Pagination } from '../ui/Pagination'
 import { CardControls } from '../ui/CardControls'
@@ -74,6 +75,24 @@ const SORT_COMPARATORS: Record<SortByOption, (a: Deployment, b: Deployment) => n
   name: commonComparators.string<Deployment>('name'),
   cluster: commonComparators.string<Deployment>('cluster') }
 
+// #6119: hoist to module scope so the reference is stable across renders.
+// Inline useCardData filter/sort objects caused "Maximum update depth
+// exceeded" on the deployments card — same pattern as #6232's
+// DeploymentStatus fix.
+const CARD_DATA_FILTER_CONFIG = {
+  searchFields: ['name', 'namespace', 'cluster'] as (keyof Deployment)[],
+  clusterField: 'cluster' as keyof Deployment,
+  storageKey: 'deployment-progress',
+} as const
+
+const CARD_DATA_SORT_CONFIG = {
+  defaultField: 'status' as SortByOption,
+  defaultDirection: 'asc' as SortDirection,
+  comparators: SORT_COMPARATORS,
+} as const
+
+const DEFAULT_PAGE_LIMIT = 5
+
 export function DeploymentProgress({ config }: DeploymentProgressProps) {
   const { t } = useTranslation()
   const cluster = config?.cluster
@@ -85,7 +104,8 @@ export function DeploymentProgress({ config }: DeploymentProgressProps) {
     isDemoFallback,
     isFailed,
     consecutiveFailures,
-    error
+    error,
+    lastRefresh: deploymentsLastRefresh
   } = useCachedDeployments(cluster, namespace)
   const { drillToDeployment } = useDrillDownActions()
 
@@ -112,11 +132,26 @@ export function DeploymentProgress({ config }: DeploymentProgressProps) {
     deploying: progressingDeployments.filter((d) => d.status === 'deploying').length,
     failed: progressingDeployments.filter((d) => d.status === 'failed').length }
 
-  // Apply card-specific status filter before passing to useCardData
-  const statusFilteredDeployments = (() => {
+  // Apply card-specific status filter before passing to useCardData.
+  // #6119: memoized so the array reference is stable across renders when
+  // the source data and filter are unchanged — otherwise downstream
+  // useMemo dependencies in useCardData invalidate every render. Same
+  // pattern as #6232's DeploymentStatus fix.
+  const statusFilteredDeployments = useMemo(() => {
     if (statusFilter === 'all') return progressingDeployments
     return progressingDeployments.filter((d) => d.status === statusFilter)
-  })()
+  }, [progressingDeployments, statusFilter])
+
+  // #6119: stable config reference for useCardData; filter/sort/limit
+  // shapes are hoisted to module scope above.
+  const cardDataConfig = useMemo(
+    () => ({
+      filter: CARD_DATA_FILTER_CONFIG,
+      sort: CARD_DATA_SORT_CONFIG,
+      defaultLimit: DEFAULT_PAGE_LIMIT,
+    }),
+    [],
+  )
 
   // useCardData handles: global filters, local cluster filter, search, sort, pagination
   const {
@@ -131,16 +166,7 @@ export function DeploymentProgress({ config }: DeploymentProgressProps) {
     filters,
     sorting,
     containerRef,
-    containerStyle } = useCardData<Deployment, SortByOption>(statusFilteredDeployments, {
-    filter: {
-      searchFields: ['name', 'namespace', 'cluster'] as (keyof Deployment)[],
-      clusterField: 'cluster' as keyof Deployment,
-      storageKey: 'deployment-progress' },
-    sort: {
-      defaultField: 'status' as SortByOption,
-      defaultDirection: 'asc' as SortDirection,
-      comparators: SORT_COMPARATORS },
-    defaultLimit: 5 })
+    containerStyle } = useCardData<Deployment, SortByOption>(statusFilteredDeployments, cardDataConfig)
 
   // Handle filter changes (reset page)
   const handleFilterChange = (newFilter: StatusFilter) => {
@@ -210,6 +236,17 @@ export function DeploymentProgress({ config }: DeploymentProgressProps) {
               {filters.localClusterFilter.length}/{filters.availableClusters.length}
             </span>
           )}
+          {/* part 4: freshness indicator.
+              followup: hide timestamp in demo mode — `useCachedDeployments`
+              can preserve `lastRefresh` from a prior live session, which
+              would show a misleading "Updated X ago" against demo data. */}
+          <RefreshIndicator
+            isRefreshing={isRefreshing}
+            lastUpdated={isDemoFallback || typeof deploymentsLastRefresh !== 'number' ? null : new Date(deploymentsLastRefresh)}
+            size="sm"
+            showLabel={true}
+            staleThresholdMinutes={5}
+          />
         </div>
         <div className="flex items-center gap-2">
           {/* Cluster Filter */}

@@ -373,6 +373,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/kubeconfig/import", s.handleKubeconfigImportHTTP)
 	mux.HandleFunc("/kubeconfig/add", s.handleKubeconfigAddHTTP)
 	mux.HandleFunc("/kubeconfig/test", s.handleKubeconfigTestHTTP)
+	mux.HandleFunc("/kubeconfig/remove", s.handleKubeconfigRemoveHTTP)
 
 	// Settings endpoints for API key management
 	mux.HandleFunc("/settings/keys", s.handleSettingsKeys)
@@ -445,6 +446,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/auto-update/config", s.handleAutoUpdateConfig)
 	mux.HandleFunc("/auto-update/status", s.handleAutoUpdateStatus)
 	mux.HandleFunc("/auto-update/trigger", s.handleAutoUpdateTrigger)
+	mux.HandleFunc("/auto-update/cancel", s.handleAutoUpdateCancel)
 
 	// Prometheus query proxy - queries Prometheus in user clusters via K8s API server proxy
 	mux.HandleFunc("/prometheus/query", s.handlePrometheusQuery)

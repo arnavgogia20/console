@@ -47,6 +47,7 @@ export const CARD_TITLES: Record<string, string> = {
   warning_events: 'Warning Events',
   recent_events: 'Recent Events',
   events_timeline: 'Events Timeline',
+  pod_logs: 'Pod Logs',
 
   // Trend cards
   pod_health_trend: 'Pod Health Trend',
@@ -181,6 +182,7 @@ export const CARD_TITLES: Record<string, string> = {
   upgrade_status: 'Cluster Upgrade Status',
   user_management: 'User Management',
   github_activity: 'GitHub Activity',
+  issue_activity_chart: 'Daily Issues & PRs',
   kubectl: 'Kubectl Terminal',
   // weather — registered via unified descriptor system
   rss_feed: 'RSS Feed',
@@ -346,6 +348,7 @@ export const CARD_DESCRIPTIONS: Record<string, string> = {
   warning_events: 'Warning-level events that may need attention.',
   recent_events: 'Most recent events across all clusters.',
   events_timeline: 'Timeline chart of event frequency over time.',
+  pod_logs: 'Live tail of container logs for any pod across your clusters.',
   pod_health_trend: 'Historical trend of pod health status over time.',
   resource_trend: 'Resource usage trends showing CPU and memory over time.',
   storage_overview: 'Persistent volume and storage class overview.',
@@ -458,6 +461,7 @@ export const CARD_DESCRIPTIONS: Record<string, string> = {
   upgrade_status: 'Kubernetes version upgrade status and available upgrades.',
   user_management: 'Manage console users and their roles.',
   github_activity: 'Recent GitHub activity: commits, PRs, and issues.',
+  issue_activity_chart: 'Daily chart of issues opened vs closed and PRs merged, with configurable lookback period.',
   kubectl: 'Interactive kubectl terminal for running commands.',
   // weather — registered via unified descriptor system
   rss_feed: 'RSS feed reader for Kubernetes news and blogs.',

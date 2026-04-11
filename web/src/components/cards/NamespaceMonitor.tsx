@@ -9,6 +9,7 @@ import { useClusters } from '../../hooks/useMCP'
 import { useCachedNamespaces, useCachedDeployments, useCachedServices, useCachedPVCs, useCachedPods, useCachedConfigMaps, useCachedSecrets, useCachedJobs } from '../../hooks/useCachedData'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
+import { BaseModal } from '../../lib/modals/BaseModal'
 import { CardComponentProps } from './cardRegistry'
 import { useCardLoadingState } from './CardDataContext'
 import { useDemoMode } from '../../hooks/useDemoMode'
@@ -86,6 +87,20 @@ const ChangeAnimations: Record<Exclude<ChangeType, null>, string> = {
   modified: 'animate-pulse bg-yellow-500/20 border-yellow-500/50',
   deleted: 'animate-pulse bg-red-500/20 border-red-500/50 opacity-50',
   error: 'animate-pulse bg-red-500/30 border-red-500/60' }
+
+/**
+ * Hard cap on the number of namespace rows rendered per cluster (#6208).
+ *
+ * Each namespace row triggers 7 separate `.filter()` passes over the full
+ * pods/deployments/services/configmaps/secrets/PVCs/jobs lists. With 80+
+ * namespaces and 500 pods, every state update was triggering an
+ * O(namespaces × resources) recomputation across all of them at once and
+ * dropping frames. Capping at 30 keeps the worst case to 30 × 7 × N
+ * filters per refresh, while still showing all the namespaces for
+ * realistically-sized clusters. The "more namespaces filtered out" hint
+ * below the list tells the user to use the search box to narrow down.
+ */
+const MAX_NAMESPACES_RENDERED_PER_CLUSTER = 30
 
 export function NamespaceMonitor({ config: _config }: CardComponentProps) {
   const { isDemoMode } = useDemoMode()
@@ -443,30 +458,15 @@ export function NamespaceMonitor({ config: _config }: CardComponentProps) {
   const ResourceModal = () => {
     if (!modalResource) return null
 
+    const handleCloseModal = () => setModalResource(null)
+    const ResourceIcon = ResourceIcons[modalResource.type]
+
     return (
-      <div 
-        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-2xl" 
-        onClick={() => setModalResource(null)}
-      >
-        <div 
-          className="bg-card border border-border rounded-lg shadow-xl w-full max-w-lg mx-4" 
-          onClick={e => e.stopPropagation()}
-          role="dialog"
-          aria-modal="true"
-        >
-          <div className="flex items-center justify-between p-4 border-b border-border">
-            <div className="flex items-center gap-2">
-              {(() => {
-                const Icon = ResourceIcons[modalResource.type]
-                return <Icon className={`w-5 h-5 ${ResourceColors[modalResource.type]}`} />
-              })()}
-              <span className="font-medium text-foreground">{modalResource.name}</span>
-            </div>
-            <button onClick={() => setModalResource(null)} className="p-2 hover:bg-secondary rounded min-h-11 min-w-11 flex items-center justify-center">
-              <X className="w-4 h-4 text-muted-foreground" />
-            </button>
-          </div>
-          <div className="p-4 space-y-3">
+      <BaseModal isOpen={!!modalResource} onClose={handleCloseModal} size="sm">
+        <BaseModal.Header title={modalResource.name} icon={ResourceIcon} onClose={handleCloseModal} />
+
+        <BaseModal.Content>
+          <div className="space-y-3">
             <div className="flex items-center gap-2 text-sm">
               <Server className="w-4 h-4 text-muted-foreground" />
               <span className="text-muted-foreground">Cluster:</span>
@@ -483,28 +483,29 @@ export function NamespaceMonitor({ config: _config }: CardComponentProps) {
               <span className="text-foreground capitalize">{modalResource.type}</span>
             </div>
           </div>
-          <div className="flex justify-end gap-2 p-4 border-t border-border">
-            <button
-              onClick={() => {
-                if (modalResource.type === 'pods') {
-                  drillToPod(modalResource.cluster, modalResource.namespace, modalResource.name)
-                } else if (modalResource.type === 'deployments') {
-                  drillToDeployment(modalResource.cluster, modalResource.namespace, modalResource.name)
-                } else if (modalResource.type === 'services') {
-                  drillToService(modalResource.cluster, modalResource.namespace, modalResource.name)
-                } else if (modalResource.type === 'pvcs') {
-                  drillToPVC(modalResource.cluster, modalResource.namespace, modalResource.name)
-                }
-                setModalResource(null)
-              }}
-              className="flex items-center gap-2 px-3 py-1.5 bg-purple-500 hover:bg-purple-600 rounded text-sm text-white transition-colors"
-            >
-              <Eye className="w-4 h-4" />
-              View Details
-            </button>
-          </div>
-        </div>
-      </div>
+        </BaseModal.Content>
+
+        <BaseModal.Footer showKeyboardHints={false}>
+          <button
+            onClick={() => {
+              if (modalResource.type === 'pods') {
+                drillToPod(modalResource.cluster, modalResource.namespace, modalResource.name)
+              } else if (modalResource.type === 'deployments') {
+                drillToDeployment(modalResource.cluster, modalResource.namespace, modalResource.name)
+              } else if (modalResource.type === 'services') {
+                drillToService(modalResource.cluster, modalResource.namespace, modalResource.name)
+              } else if (modalResource.type === 'pvcs') {
+                drillToPVC(modalResource.cluster, modalResource.namespace, modalResource.name)
+              }
+              setModalResource(null)
+            }}
+            className="flex items-center gap-2 px-3 py-1.5 bg-purple-500 hover:bg-purple-600 rounded text-sm text-white transition-colors ml-auto"
+          >
+            <Eye className="w-4 h-4" />
+            View Details
+          </button>
+        </BaseModal.Footer>
+      </BaseModal>
     )
   }
 
@@ -515,7 +516,7 @@ export function NamespaceMonitor({ config: _config }: CardComponentProps) {
     }`}>
       <div className="flex items-center justify-between p-3 border-b border-border">
         <span className="text-sm font-medium text-foreground">Recent Changes</span>
-        <button onClick={() => setShowChangesPanel(false)} className="p-2 hover:bg-secondary rounded min-h-11 min-w-11 flex items-center justify-center">
+        <button onClick={() => setShowChangesPanel(false)} aria-label="Close recent changes panel" className="p-2 hover:bg-secondary rounded min-h-11 min-w-11 flex items-center justify-center">
           <X className="w-4 h-4 text-muted-foreground" />
         </button>
       </div>
@@ -627,9 +628,13 @@ export function NamespaceMonitor({ config: _config }: CardComponentProps) {
           {filteredClusters.map(cluster => {
             const isExpanded = expandedClusters.has(cluster.name)
             const namespaceData = isExpanded ? getNamespaceData(cluster.name) : new Map<string, NamespaceData>()
-            const namespaceList = Array.from(namespaceData.keys())
+            const allNamespaces = Array.from(namespaceData.keys())
               .filter(ns => !ns.startsWith('kube-') && ns !== 'openshift' && !ns.startsWith('openshift-'))
               .sort()
+            // #6208: cap rows rendered to keep render cost bounded. The
+            // truncated count drives the "n more namespaces" hint below.
+            const namespaceList = allNamespaces.slice(0, MAX_NAMESPACES_RENDERED_PER_CLUSTER)
+            const truncatedCount = allNamespaces.length - namespaceList.length
 
             return (
               <div key={cluster.name} className="mb-1">
@@ -824,6 +829,13 @@ export function NamespaceMonitor({ config: _config }: CardComponentProps) {
                           </div>
                         )
                       })
+                    )}
+                    {/* #6208: surface the truncation hint so users know there
+                        are more namespaces beyond what was rendered. */}
+                    {truncatedCount > 0 && (
+                      <div className="py-2 px-4 text-xs text-muted-foreground italic">
+                        +{truncatedCount} more namespace{truncatedCount === 1 ? '' : 's'} not shown — use the search box to narrow down.
+                      </div>
                     )}
                   </div>
                 )}

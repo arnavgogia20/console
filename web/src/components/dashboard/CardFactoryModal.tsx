@@ -556,11 +556,13 @@ const T2_TEMPLATES: T2Template[] = [
     \`kubectl port-forward -n \${f.namespace} \${f.resource} \${f.localPort}:\${f.remotePort}\`
 
   const copyCommand = (f) => {
-    try {
-      navigator?.clipboard?.writeText?.(getCommand(f))
-      setCopied(f.id)
-      setTimeout(() => setCopied(null), ${COPY_FEEDBACK_TIMEOUT_MS})
-    } catch {}
+    // #6229: catch the dropped Promise so a failed write (clipboard
+    // permission denied, blocked iframe, etc.) doesn't surface as an
+    // unhandled rejection in the generated card. The optional chain
+    // already guards undefined.
+    navigator?.clipboard?.writeText?.(getCommand(f))?.catch?.(() => {})
+    setCopied(f.id)
+    setTimeout(() => setCopied(null), ${COPY_FEEDBACK_TIMEOUT_MS})
   }
 
   return (
@@ -753,7 +755,7 @@ export function CardFactoryModal({ isOpen, onClose, onCardCreated, embedded = fa
   const [t1Layout, setT1Layout] = useState<'list' | 'stats' | 'stats-and-list'>('list')
   const [t1Columns, setT1Columns] = useState<DynamicCardColumn[]>([
     { field: 'name', label: 'Name' },
-    { field: 'status', label: 'Status', format: 'badge', badgeColors: { healthy: 'bg-green-500/20 text-green-400 dark:bg-green-900/30 dark:text-green-400', error: 'bg-red-500/20 text-red-400 dark:bg-red-900/30 dark:text-red-400' } },
+    { field: 'status', label: 'Status', format: 'badge', badgeColors: { healthy: 'bg-green-500/20 text-green-400', error: 'bg-red-500/20 text-red-400' } },
   ])
   const [t1DataJson, setT1DataJson] = useState('[\n  { "name": "item-1", "status": "healthy" },\n  { "name": "item-2", "status": "error" }\n]')
   const [t1Width, setT1Width] = useState(6)
@@ -1451,7 +1453,7 @@ function TemplateDropdown<T extends { name: string }>({
         {label}
       </button>
       {open && (
-        <div className="absolute z-50 top-full mt-1 left-0 bg-card border border-border rounded-lg shadow-lg p-1.5 min-w-[200px]">
+        <div className="absolute z-dropdown top-full mt-1 left-0 bg-card border border-border rounded-lg shadow-lg p-1.5 min-w-[200px]">
           {templates.map(tpl => (
             <button
               key={tpl.name}

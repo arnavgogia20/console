@@ -4,6 +4,7 @@ import { useClusters } from '../../hooks/useMCP'
 import { useGlobalFilters } from '../../hooks/useGlobalFilters'
 import { useDrillDownActions } from '../../hooks/useDrillDown'
 import { useMissions } from '../../hooks/useMissions'
+import { ConfirmMissionPromptDialog } from '../missions/ConfirmMissionPromptDialog'
 import { useLocalAgent } from '../../hooks/useLocalAgent'
 import { useDemoMode } from '../../hooks/useDemoMode'
 import { useCardData, commonComparators } from '../../lib/cards/cardHooks'
@@ -11,6 +12,7 @@ import { CardSearchInput, CardControlsRow, CardPaginationFooter, CardAIActions }
 import { StatusBadge } from '../ui/StatusBadge'
 import { useCardLoadingState } from './CardDataContext'
 import { LOCAL_AGENT_WS_URL } from '../../lib/constants'
+import { safeGetJSON, safeSetJSON } from '../../lib/safeLocalStorage'
 import { useTranslation } from 'react-i18next'
 
 const WS_CONNECTION_TIMEOUT_MS = 5000
@@ -32,24 +34,21 @@ const STORAGE_KEY = 'kc-cluster-versions'
 const VERSION_CACHE_TTL = 5 * 60 * 1000 // 5 minutes
 
 // Load persisted cache from localStorage on module init
-const versionCache: Record<string, { version: string; timestamp: number }> = (() => {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY)
-    return stored ? JSON.parse(stored) : {}
-  } catch {
-    return {}
-  }
-})()
+const versionCache: Record<string, { version: string; timestamp: number }> =
+  typeof window === 'undefined'
+    ? {}
+    : safeGetJSON<Record<string, { version: string; timestamp: number }>>(STORAGE_KEY, {})
+
+/** Debounce interval for persisting the version cache to localStorage */
+const PERSIST_DEBOUNCE_MS = 500
 
 // Persist cache to localStorage (debounced to avoid excessive writes)
 let persistTimer: ReturnType<typeof setTimeout> | null = null
 function persistCache() {
   if (persistTimer) clearTimeout(persistTimer)
   persistTimer = setTimeout(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(versionCache))
-    } catch { /* quota exceeded — non-critical */ }
-  }, 500)
+    safeSetJSON(STORAGE_KEY, versionCache)
+  }, PERSIST_DEBOUNCE_MS)
 }
 
 // Get cached version if still valid
@@ -84,6 +83,12 @@ function createVersionWsHandle(): VersionWsHandle {
   let connecting = false
   let destroyed = false
   const pendingRequests = new Map<string, (version: string | null) => void>()
+  /** Outstanding `setTimeout` handles created inside `ensureWs()` so
+   * `destroy()` can cancel them. Previously these were discarded, so the
+   * 10s connection timeout fired AFTER unmount and held stale closure
+   * references calling `clearInterval` and `reject` on already-settled
+   * promises (#6206). */
+  const pendingEnsureTimers = new Set<ReturnType<typeof setTimeout>>()
 
   function rejectAllPending() {
     pendingRequests.forEach((resolver) => resolver(null))
@@ -119,7 +124,16 @@ function createVersionWsHandle(): VersionWsHandle {
           if (destroyed) { clearInterval(checkInterval); reject(new Error('Handle destroyed')); return }
           if (ws?.readyState === WebSocket.OPEN) { clearInterval(checkInterval); resolve(ws) }
         }, 100)
-        setTimeout(() => { clearInterval(checkInterval); reject(new Error('WebSocket connection timeout')) }, WS_CONNECTION_TIMEOUT_MS)
+        // #6206: store the timeout handle so destroy() can cancel it.
+        // Without this, the timeout would fire after unmount, call
+        // clearInterval on a dead handle, and reject an already-settled
+        // promise — holding stale closure references for up to 10s.
+        const timeoutHandle = setTimeout(() => {
+          pendingEnsureTimers.delete(timeoutHandle)
+          clearInterval(checkInterval)
+          reject(new Error('WebSocket connection timeout'))
+        }, WS_CONNECTION_TIMEOUT_MS)
+        pendingEnsureTimers.add(timeoutHandle)
       })
     }
 
@@ -230,6 +244,10 @@ function createVersionWsHandle(): VersionWsHandle {
 
   function destroy() {
     destroyed = true
+    // Cancel any in-flight ensureWs() timeouts before closing the socket
+    // so their stale closures don't fire after unmount (#6206).
+    pendingEnsureTimers.forEach(t => clearTimeout(t))
+    pendingEnsureTimers.clear()
     closeWs()
   }
 
@@ -480,19 +498,52 @@ export function UpgradeStatus({ config: _config }: UpgradeStatusProps) {
       }
     }, RETRY_INTERVAL_MS)
 
+    // #6292: re-fetch ALL clusters on VERSION_CACHE_TTL so a successfully
+    // upgraded cluster reflects its new version. Without this loop,
+    // `fetchedClustersRef` kept the old cluster in the "already fetched,
+    // skip" set forever and the card showed the pre-upgrade version
+    // until the user navigated away and came back. Also clears the
+    // per-cluster version cache so `getCachedVersion()` re-fetches.
+    const refreshInterval = setInterval(() => {
+      if (!agentConnected) return
+      fetchedClustersRef.current.clear()
+      for (const c of allClusters) {
+        delete versionCache[c.name]
+      }
+      persistCache()
+      fetchVersions()
+    }, VERSION_CACHE_TTL)
+
     return () => {
       cancelled = true
       clearInterval(retryInterval)
+      clearInterval(refreshInterval)
     }
   }, [isDemoMode, agentConnected, allClusters])
 
-  const handleStartUpgrade = (clusterName: string, currentVersion: string, targetVersion: string) => {
-    startMission({
-      title: `Upgrade ${clusterName}`,
-      description: `Upgrade from ${currentVersion} to ${targetVersion}`,
-      type: 'upgrade',
-      cluster: clusterName,
-      initialPrompt: `I want to upgrade the Kubernetes cluster "${clusterName}" from version ${currentVersion} to ${targetVersion}.
+  // #6309: show the prompt-confirmation dialog before starting the
+  // upgrade mission. Previously, clicking "Start Upgrade" launched
+  // the AI agent immediately with no chance for the user to review
+  // or edit the prompt — a critical-function click with no gate.
+  // The ConfirmMissionPromptDialog was added in #5913 for exactly
+  // this pattern (installer flows); here we reuse it for upgrades.
+  interface PendingUpgrade {
+    clusterName: string
+    currentVersion: string
+    targetVersion: string
+    prompt: string
+  }
+  const [pendingUpgrade, setPendingUpgrade] = useState<PendingUpgrade | null>(null)
+  // #6320: guards against double-clicking the Confirm button in the
+  // dialog. `setPendingUpgrade(null)` is async, so a second click that
+  // fires before React re-renders would still see `pendingUpgrade`
+  // non-null, pass the !pendingUpgrade guard, and call startMission
+  // again. A ref flipped synchronously at the top of the handler
+  // closes that window.
+  const startingMissionRef = useRef(false)
+
+  const buildUpgradePrompt = (clusterName: string, currentVersion: string, targetVersion: string) =>
+    `I want to upgrade the Kubernetes cluster "${clusterName}" from version ${currentVersion} to ${targetVersion}.
 
 Please help me with this upgrade by:
 1. First checking the cluster's current state and any prerequisites
@@ -501,11 +552,43 @@ Please help me with this upgrade by:
 4. Performing the upgrade with proper monitoring
 5. Validating the upgrade was successful
 
-Please proceed step by step and ask for confirmation before making any changes.`,
+Please proceed step by step and ask for confirmation before making any changes.`
+
+  const handleStartUpgrade = (clusterName: string, currentVersion: string, targetVersion: string) => {
+    // Stage the upgrade in pending state — the dialog below will call
+    // confirmStartUpgrade (with the possibly-edited prompt) or cancel.
+    setPendingUpgrade({
+      clusterName,
+      currentVersion,
+      targetVersion,
+      prompt: buildUpgradePrompt(clusterName, currentVersion, targetVersion),
+    })
+  }
+
+  const confirmStartUpgrade = (editedPrompt: string) => {
+    // #6320: double-click guard. The two checks work together:
+    //   - startingMissionRef: synchronous; catches back-to-back clicks
+    //     inside a single React commit cycle.
+    //   - !pendingUpgrade: catches stale-closure invocations after
+    //     the dialog has been dismissed but a queued click is still
+    //     pending.
+    if (!pendingUpgrade || startingMissionRef.current) return
+    startingMissionRef.current = true
+    const { clusterName, currentVersion, targetVersion } = pendingUpgrade
+    startMission({
+      title: `Upgrade ${clusterName}`,
+      description: `Upgrade from ${currentVersion} to ${targetVersion}`,
+      type: 'upgrade',
+      cluster: clusterName,
+      initialPrompt: editedPrompt,
       context: {
         clusterName,
         currentVersion,
         targetVersion } })
+    setPendingUpgrade(null)
+    // Reset the ref on the next tick so a subsequent (new) upgrade
+    // mission can run normally.
+    setTimeout(() => { startingMissionRef.current = false }, 0)
   }
 
   // Apply global filters to get clusters, then build version data
@@ -718,6 +801,18 @@ Please proceed step by step and ask for confirmation before making any changes.`
         onPageChange={goToPage}
         needsPagination={needsPagination}
       />
+
+      {/* #6309: confirm prompt before running the upgrade mission. */}
+      {pendingUpgrade && (
+        <ConfirmMissionPromptDialog
+          open={true}
+          missionTitle={`Upgrade ${pendingUpgrade.clusterName}`}
+          missionDescription={`Upgrade from ${pendingUpgrade.currentVersion} to ${pendingUpgrade.targetVersion}`}
+          initialPrompt={pendingUpgrade.prompt}
+          onCancel={() => setPendingUpgrade(null)}
+          onConfirm={confirmStartUpgrade}
+        />
+      )}
     </div>
   )
 }

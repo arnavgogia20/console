@@ -28,16 +28,10 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 }
 
 func (s *Server) handleClustersHTTP(w http.ResponseWriter, r *http.Request) {
-	origin := r.Header.Get("Origin")
-	if s.isAllowedOrigin(origin) {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-	}
-	w.Header().Set("Access-Control-Allow-Private-Network", "true")
+	s.setCORSHeaders(w, r)
 	w.Header().Set("Content-Type", "application/json")
 
 	if r.Method == "OPTIONS" {
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -1363,6 +1357,45 @@ func (s *Server) handleAutoUpdateTrigger(w http.ResponseWriter, r *http.Request)
 	writeJSON(w,map[string]interface{}{"success": true, "message": "update check triggered"})
 }
 
+// handleAutoUpdateCancel cancels an in-progress update. Cancellation is
+// best-effort: the currently-running step may complete before the abort is
+// honored, and the update cannot be cancelled once the restart step has begun
+// (startup-oauth.sh is spawned as a detached process).
+func (s *Server) handleAutoUpdateCancel(w http.ResponseWriter, r *http.Request) {
+	s.setCORSHeaders(w, r)
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == "OPTIONS" {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method != "POST" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !s.validateToken(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		writeJSON(w, map[string]string{"error": "unauthorized"})
+		return
+	}
+
+	if s.updateChecker == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]string{"error": "update checker not initialized"})
+		return
+	}
+
+	if !s.updateChecker.CancelUpdate() {
+		w.WriteHeader(http.StatusConflict)
+		writeJSON(w, map[string]interface{}{"success": false, "error": "no update in progress"})
+		return
+	}
+	writeJSON(w, map[string]interface{}{"success": true, "message": "cancellation requested"})
+}
+
 // handleRenameContextHTTP renames a kubeconfig context
 func (s *Server) handleRenameContextHTTP(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
@@ -1540,6 +1573,54 @@ func (s *Server) handleKubeconfigImportHTTP(w http.ResponseWriter, r *http.Reque
 type kubeconfigAddResponse struct {
 	Success bool   `json:"success"`
 	Error   string `json:"error,omitempty"`
+}
+
+// handleKubeconfigRemoveHTTP removes a cluster context from the kubeconfig (#5658).
+func (s *Server) handleKubeconfigRemoveHTTP(w http.ResponseWriter, r *http.Request) {
+	s.setCORSHeaders(w, r)
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS") // Copilot: setCORSHeaders defaults to GET
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if !s.validateToken(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		writeJSON(w, map[string]string{"error": "Unauthorized"})
+		return
+	}
+
+	if r.Method != "POST" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		writeJSON(w, map[string]string{"error": "Method not allowed"})
+		return
+	}
+
+	var req struct {
+		Context string `json:"context"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Context == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]string{"error": "Missing 'context' field"})
+		return
+	}
+
+	if s.k8sClient == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]string{"error": "k8s client not initialized"})
+		return
+	}
+
+	if err := s.k8sClient.RemoveContext(req.Context); err != nil {
+		slog.Error("[kubeconfig] failed to remove context", "context", req.Context, "error", err)
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, map[string]interface{}{"ok": true, "removed": req.Context})
 }
 
 // handleKubeconfigAddHTTP adds a cluster from structured form fields

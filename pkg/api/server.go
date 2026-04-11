@@ -419,6 +419,18 @@ setInterval(async function(){try{var r=await fetch('/healthz');if(r.ok){var d=aw
 </body>
 </html>`
 
+// oauthConfigured reports whether the server has a usable GitHub OAuth
+// configuration. Both the client ID AND the client secret must be present
+// — a partial config (one without the other) is unusable because the
+// token-exchange step cannot authenticate to GitHub without the secret,
+// and the health probe must not report such an install as OAuth-ready
+// (#6056). Prior to the fix this returned true as soon as the client ID
+// was set, which caused downstream UIs to show a "GitHub login" button
+// that was guaranteed to fail on click.
+func (s *Server) oauthConfigured() bool {
+	return s.config.GitHubClientID != "" && s.config.GitHubSecret != ""
+}
+
 func (s *Server) setupRoutes() {
 	// Minimal probe endpoint for load balancers and k8s liveness checks.
 	// Returns only status — no configuration metadata.
@@ -461,7 +473,7 @@ func (s *Server) setupRoutes() {
 		resp := fiber.Map{
 			"status":           healthStatus,
 			"version":          Version,
-			"oauth_configured": s.config.GitHubClientID != "",
+			"oauth_configured": s.oauthConfigured(),
 			"in_cluster":       inCluster,
 			"install_method":   detectInstallMethod(inCluster),
 			"project":          s.config.ConsoleProject,
@@ -588,6 +600,8 @@ func (s *Server) setupRoutes() {
 	})
 
 	// Active users heartbeat endpoint (for demo mode session counting)
+	// This is unauthenticated telemetry — session IDs are validated for length
+	// and the total number of unique sessions is capped to prevent inflation.
 	s.app.Post("/api/active-users", func(c *fiber.Ctx) error {
 		var body struct {
 			SessionID string `json:"sessionId"`
@@ -595,7 +609,9 @@ func (s *Server) setupRoutes() {
 		if err := c.BodyParser(&body); err != nil || body.SessionID == "" {
 			return c.Status(400).JSON(fiber.Map{"error": "sessionId required"})
 		}
-		s.hub.RecordDemoSession(body.SessionID)
+		if !s.hub.RecordDemoSession(body.SessionID) {
+			return c.Status(429).JSON(fiber.Map{"error": "session limit reached"})
+		}
 		demoCount := s.hub.GetDemoSessionCount()
 		return c.JSON(fiber.Map{
 			"activeUsers":      demoCount,
@@ -848,7 +864,7 @@ func (s *Server) setupRoutes() {
 
 	// GitOps routes (drift detection and sync)
 	// SECURITY: All GitOps routes require authentication in both dev and production modes
-	gitopsHandlers := handlers.NewGitOpsHandlers(s.bridge, s.k8sClient)
+	gitopsHandlers := handlers.NewGitOpsHandlers(s.bridge, s.k8sClient, s.store)
 	api.Get("/gitops/drifts", gitopsHandlers.ListDrifts)
 	api.Get("/gitops/helm-releases", gitopsHandlers.ListHelmReleases)
 	api.Get("/gitops/helm-history", gitopsHandlers.ListHelmHistory)
@@ -866,7 +882,7 @@ func (s *Server) setupRoutes() {
 	api.Post("/gitops/helm-uninstall", gitopsHandlers.UninstallHelmRelease)
 	api.Post("/gitops/helm-upgrade", gitopsHandlers.UpgradeHelmRelease)
 	// Helm self-upgrade (in-cluster Deployment patch)
-	selfUpgradeHandler := handlers.NewSelfUpgradeHandler(s.k8sClient, s.hub)
+	selfUpgradeHandler := handlers.NewSelfUpgradeHandler(s.k8sClient, s.hub, s.store)
 	api.Get("/self-upgrade/status", selfUpgradeHandler.GetStatus)
 	api.Post("/self-upgrade/trigger", selfUpgradeHandler.TriggerUpgrade)
 	// ArgoCD routes (Application CRD discovery and sync)
@@ -965,13 +981,46 @@ func (s *Server) setupRoutes() {
 	})
 	api.Get("/rewards/github", rewardsHandler.GetGitHubRewards)
 
+	// Persistent per-user reward balances (issue #6011). Every authenticated
+	// user can read and mutate their own row — no RBAC gate needed because
+	// the handler scopes every query by the JWT-derived user id.
+	rewardsPersistence := handlers.NewRewardsPersistenceHandler(s.store)
+	api.Get("/rewards/me", rewardsPersistence.GetUserRewards)
+	api.Put("/rewards/me", rewardsPersistence.UpdateUserRewards)
+	api.Post("/rewards/coins", rewardsPersistence.IncrementCoins)
+	api.Post("/rewards/daily-bonus", rewardsPersistence.ClaimDailyBonus)
+
+	// Persistent per-user token-usage state (folded into #6011 PR — same
+	// motivation: clearing the browser cache should not wipe the running
+	// totals shown in the token-budget widget). Every user reads and writes
+	// only their own row; the handler resolves the user via JWT.
+	tokenUsage := handlers.NewTokenUsageHandler(s.store)
+	api.Get("/token-usage/me", tokenUsage.GetUserTokenUsage)
+	api.Post("/token-usage/me", tokenUsage.UpdateUserTokenUsage)
+	api.Post("/token-usage/delta", tokenUsage.AddTokenDelta)
+
 	// Nightly E2E status (GitHub Actions proxy with server-side token + cache)
 	nightlyE2E := handlers.NewNightlyE2EHandler(s.config.GitHubToken)
 	api.Get("/nightly-e2e/runs", nightlyE2E.GetRuns)
 	api.Get("/nightly-e2e/run-logs", nightlyE2E.GetRunLogs)
 
-	// GPU reservation routes
-	gpuHandler := handlers.NewGPUHandler(s.store)
+	// GPU reservation routes — capacity provider uses live k8s node data
+	// so the server never trusts client-supplied GPU limits (#5421).
+	gpuCapacity := handlers.ClusterCapacityProvider(func(ctx context.Context, cluster string) int {
+		if s.k8sClient == nil {
+			return 0
+		}
+		nodes, err := s.k8sClient.GetNodes(ctx, cluster)
+		if err != nil {
+			return 0
+		}
+		total := 0
+		for _, n := range nodes {
+			total += n.GPUCount
+		}
+		return total
+	})
+	gpuHandler := handlers.NewGPUHandler(s.store, gpuCapacity)
 	api.Post("/gpu/reservations", gpuHandler.CreateReservation)
 	api.Get("/gpu/reservations", gpuHandler.ListReservations)
 	api.Get("/gpu/reservations/:id", gpuHandler.GetReservation)

@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/kubestellar/console/pkg/models"
+	"github.com/kubestellar/console/pkg/store"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -66,10 +67,27 @@ func (m *MockStore) DeleteDashboard(id uuid.UUID) error                         
 
 func (m *MockStore) GetCard(id uuid.UUID) (*models.Card, error)                     { return nil, nil }
 func (m *MockStore) GetDashboardCards(dashboardID uuid.UUID) ([]models.Card, error) { return nil, nil }
-func (m *MockStore) CreateCard(card *models.Card) error                             { return nil }
-func (m *MockStore) UpdateCard(card *models.Card) error                             { return nil }
-func (m *MockStore) DeleteCard(id uuid.UUID) error                                  { return nil }
-func (m *MockStore) UpdateCardFocus(cardID uuid.UUID, summary string) error         { return nil }
+
+func (m *MockStore) CreateCard(card *models.Card) error { return nil }
+
+// CreateCardWithLimit is overridable so tests can exercise both the success
+// path and the ErrDashboardCardLimitReached branch of the RBAC/limit check.
+func (m *MockStore) CreateCardWithLimit(card *models.Card, maxCards int) error {
+	if len(m.ExpectedCalls) == 0 {
+		return nil
+	}
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "CreateCardWithLimit" {
+			args := m.Called(card, maxCards)
+			return args.Error(0)
+		}
+	}
+	return nil
+}
+
+func (m *MockStore) UpdateCard(card *models.Card) error                     { return nil }
+func (m *MockStore) DeleteCard(id uuid.UUID) error                          { return nil }
+func (m *MockStore) UpdateCardFocus(cardID uuid.UUID, summary string) error { return nil }
 
 func (m *MockStore) AddCardHistory(history *models.CardHistory) error { return nil }
 func (m *MockStore) GetUserCardHistory(userID uuid.UUID, limit int) ([]models.CardHistory, error) {
@@ -123,8 +141,9 @@ func (m *MockStore) GetUserNotifications(userID uuid.UUID, limit int) ([]models.
 	return nil, nil
 }
 func (m *MockStore) GetUnreadNotificationCount(userID uuid.UUID) (int, error) { return 0, nil }
-func (m *MockStore) MarkNotificationRead(id uuid.UUID) error                  { return nil }
-func (m *MockStore) MarkAllNotificationsRead(userID uuid.UUID) error          { return nil }
+func (m *MockStore) MarkNotificationRead(id uuid.UUID) error                         { return nil }
+func (m *MockStore) MarkNotificationReadByUser(id uuid.UUID, userID uuid.UUID) error { return nil }
+func (m *MockStore) MarkAllNotificationsRead(userID uuid.UUID) error                 { return nil }
 
 func (m *MockStore) CreateGPUReservation(reservation *models.GPUReservation) error  { return nil }
 func (m *MockStore) GetGPUReservation(id uuid.UUID) (*models.GPUReservation, error) { return nil, nil }
@@ -153,5 +172,159 @@ func (m *MockStore) ListActiveGPUReservations() ([]models.GPUReservation, error)
 func (m *MockStore) RevokeToken(jti string, expiresAt time.Time) error { return nil }
 func (m *MockStore) IsTokenRevoked(jti string) (bool, error)           { return false, nil }
 func (m *MockStore) CleanupExpiredTokens() (int64, error)              { return 0, nil }
+
+// GetUserRewards is overridable via testify/mock expectations so reward
+// handler tests can inject per-user state without touching SQLite.
+func (m *MockStore) GetUserRewards(userID string) (*store.UserRewards, error) {
+	if len(m.ExpectedCalls) == 0 {
+		return &store.UserRewards{UserID: userID, Level: store.DefaultUserLevel}, nil
+	}
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "GetUserRewards" {
+			args := m.Called(userID)
+			if args.Get(0) == nil {
+				return nil, args.Error(1)
+			}
+			return args.Get(0).(*store.UserRewards), args.Error(1)
+		}
+	}
+	return &store.UserRewards{UserID: userID, Level: store.DefaultUserLevel}, nil
+}
+
+// UpdateUserRewards is overridable via testify/mock expectations.
+func (m *MockStore) UpdateUserRewards(rewards *store.UserRewards) error {
+	if len(m.ExpectedCalls) == 0 {
+		return nil
+	}
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "UpdateUserRewards" {
+			args := m.Called(rewards)
+			return args.Error(0)
+		}
+	}
+	return nil
+}
+
+// IncrementUserCoins is overridable via testify/mock expectations.
+func (m *MockStore) IncrementUserCoins(userID string, delta int) (*store.UserRewards, error) {
+	if len(m.ExpectedCalls) == 0 {
+		return &store.UserRewards{UserID: userID, Level: store.DefaultUserLevel, Coins: delta}, nil
+	}
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "IncrementUserCoins" {
+			args := m.Called(userID, delta)
+			if args.Get(0) == nil {
+				return nil, args.Error(1)
+			}
+			return args.Get(0).(*store.UserRewards), args.Error(1)
+		}
+	}
+	return &store.UserRewards{UserID: userID, Level: store.DefaultUserLevel, Coins: delta}, nil
+}
+
+// ClaimDailyBonus is overridable via testify/mock expectations.
+func (m *MockStore) ClaimDailyBonus(userID string, bonusAmount int, minInterval time.Duration, now time.Time) (*store.UserRewards, error) {
+	if len(m.ExpectedCalls) == 0 {
+		return &store.UserRewards{UserID: userID, Level: store.DefaultUserLevel, BonusPoints: bonusAmount, LastDailyBonusAt: &now}, nil
+	}
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "ClaimDailyBonus" {
+			args := m.Called(userID, bonusAmount, minInterval, now)
+			if args.Get(0) == nil {
+				return nil, args.Error(1)
+			}
+			return args.Get(0).(*store.UserRewards), args.Error(1)
+		}
+	}
+	return &store.UserRewards{UserID: userID, Level: store.DefaultUserLevel, BonusPoints: bonusAmount, LastDailyBonusAt: &now}, nil
+}
+
+// GetUserTokenUsage is overridable via testify/mock expectations.
+func (m *MockStore) GetUserTokenUsage(userID string) (*store.UserTokenUsage, error) {
+	if len(m.ExpectedCalls) == 0 {
+		return &store.UserTokenUsage{UserID: userID, TokensByCategory: map[string]int64{}}, nil
+	}
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "GetUserTokenUsage" {
+			args := m.Called(userID)
+			if args.Get(0) == nil {
+				return nil, args.Error(1)
+			}
+			return args.Get(0).(*store.UserTokenUsage), args.Error(1)
+		}
+	}
+	return &store.UserTokenUsage{UserID: userID, TokensByCategory: map[string]int64{}}, nil
+}
+
+// UpdateUserTokenUsage is overridable via testify/mock expectations.
+func (m *MockStore) UpdateUserTokenUsage(usage *store.UserTokenUsage) error {
+	if len(m.ExpectedCalls) == 0 {
+		return nil
+	}
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "UpdateUserTokenUsage" {
+			args := m.Called(usage)
+			return args.Error(0)
+		}
+	}
+	return nil
+}
+
+// AddUserTokenDelta is overridable via testify/mock expectations.
+func (m *MockStore) AddUserTokenDelta(userID string, category string, delta int64, agentSessionID string) (*store.UserTokenUsage, error) {
+	if len(m.ExpectedCalls) == 0 {
+		return &store.UserTokenUsage{
+			UserID:             userID,
+			TotalTokens:        delta,
+			TokensByCategory:   map[string]int64{category: delta},
+			LastAgentSessionID: agentSessionID,
+		}, nil
+	}
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "AddUserTokenDelta" {
+			args := m.Called(userID, category, delta, agentSessionID)
+			if args.Get(0) == nil {
+				return nil, args.Error(1)
+			}
+			return args.Get(0).(*store.UserTokenUsage), args.Error(1)
+		}
+	}
+	return &store.UserTokenUsage{
+		UserID:             userID,
+		TotalTokens:        delta,
+		TokensByCategory:   map[string]int64{category: delta},
+		LastAgentSessionID: agentSessionID,
+	}, nil
+}
+
+// OAuth state — overridable via testify/mock expectations so tests can
+// exercise restart-resilience of the OAuth flow (#6028).
+func (m *MockStore) StoreOAuthState(state string, ttl time.Duration) error {
+	if len(m.ExpectedCalls) == 0 {
+		return nil
+	}
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "StoreOAuthState" {
+			args := m.Called(state, ttl)
+			return args.Error(0)
+		}
+	}
+	return nil
+}
+
+func (m *MockStore) ConsumeOAuthState(state string) (bool, error) {
+	if len(m.ExpectedCalls) == 0 {
+		return false, nil
+	}
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "ConsumeOAuthState" {
+			args := m.Called(state)
+			return args.Bool(0), args.Error(1)
+		}
+	}
+	return false, nil
+}
+
+func (m *MockStore) CleanupExpiredOAuthStates() (int64, error) { return 0, nil }
 
 func (m *MockStore) Close() error { return nil }

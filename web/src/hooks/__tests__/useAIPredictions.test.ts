@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { renderHook, act, waitFor } from '@testing-library/react'
 
-const { mockGetPredictionSettings, mockGetDemoMode, mockIsAgentUnavailable, mockReportAgentDataSuccess, mockReportAgentDataError, mockGetSettingsForBackend, mockSetActiveTokenCategory, mockFullFetchClusters, mockClusterCache } = vi.hoisted(() => ({
+const { mockGetPredictionSettings, mockGetDemoMode, mockIsAgentUnavailable, mockReportAgentDataSuccess, mockReportAgentDataError, mockGetSettingsForBackend, mockSetActiveTokenCategory, mockClearActiveTokenCategory, mockFullFetchClusters, mockClusterCache } = vi.hoisted(() => ({
   mockGetPredictionSettings: vi.fn(() => ({ aiEnabled: true, minConfidence: 50 })),
   mockGetDemoMode: vi.fn(() => true),
   mockIsAgentUnavailable: vi.fn(() => true),
@@ -9,6 +9,7 @@ const { mockGetPredictionSettings, mockGetDemoMode, mockIsAgentUnavailable, mock
   mockReportAgentDataError: vi.fn(),
   mockGetSettingsForBackend: vi.fn(() => ({ aiEnabled: true, minConfidence: 50 })),
   mockSetActiveTokenCategory: vi.fn(),
+  mockClearActiveTokenCategory: vi.fn(),
   mockFullFetchClusters: vi.fn(),
   mockClusterCache: { consecutiveFailures: 0, isFailed: false },
 }))
@@ -30,6 +31,7 @@ vi.mock('../useLocalAgent', () => ({
 
 vi.mock('../useTokenUsage', () => ({
   setActiveTokenCategory: mockSetActiveTokenCategory,
+  clearActiveTokenCategory: mockClearActiveTokenCategory,
 }))
 
 vi.mock('../mcp/shared', () => ({
@@ -231,6 +233,54 @@ describe('useAIPredictions', () => {
       expect(result.current.lastUpdated).not.toBeNull()
     })
     expect(result.current.isStale).toBe(false)
+  })
+
+  // #5937 / #5938 — when the agent backend is unavailable, predictions must
+  // be flagged stale AND subscribers must be notified so the UI re-renders
+  // to show the stale state immediately (not on the next poll cycle).
+  it('marks predictions stale and notifies subscribers when fetch rejects (#5937, #5938)', async () => {
+    mockGetDemoMode.mockReturnValue(false)
+    mockIsAgentUnavailable.mockReturnValue(false)
+    globalThis.fetch = vi.fn().mockRejectedValue(new Error('network error')) as unknown as typeof fetch
+
+    const { result } = renderHook(() => useAIPredictions())
+    // refresh() returns a promise — await the rejection path
+    await act(async () => {
+      await result.current.refresh()
+    })
+
+    expect(result.current.isStale).toBe(true)
+    expect(mockReportAgentDataError).toHaveBeenCalledWith('/predictions/ai', expect.stringContaining('network error'))
+  })
+
+  it('marks predictions stale on non-OK HTTP response (#5937, #5938)', async () => {
+    mockGetDemoMode.mockReturnValue(false)
+    mockIsAgentUnavailable.mockReturnValue(false)
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: vi.fn(),
+    }) as unknown as typeof fetch
+
+    const { result } = renderHook(() => useAIPredictions())
+    await act(async () => {
+      await result.current.refresh()
+    })
+
+    expect(result.current.isStale).toBe(true)
+    expect(mockReportAgentDataError).toHaveBeenCalledWith('/predictions/ai', 'HTTP 500')
+  })
+
+  it('marks predictions stale and notifies when agent is unavailable (#5937)', async () => {
+    mockGetDemoMode.mockReturnValue(false)
+    mockIsAgentUnavailable.mockReturnValue(true)
+
+    const { result } = renderHook(() => useAIPredictions())
+    await act(async () => {
+      await result.current.refresh()
+    })
+
+    expect(result.current.isStale).toBe(true)
   })
 
   it('analyze returns a promise', () => {
@@ -443,9 +493,11 @@ describe('useAIPredictions', () => {
       await vi.advanceTimersByTimeAsync(2000)
     })
 
-    // setActiveTokenCategory should have been called with 'predictions' and then null
-    expect(mockSetActiveTokenCategory).toHaveBeenCalledWith('predictions')
-    expect(mockSetActiveTokenCategory).toHaveBeenCalledWith(null)
+    // Per-operation tracking (#6016): setActiveTokenCategory called with
+    // opId + 'predictions', then clearActiveTokenCategory called with the
+    // same opId.
+    expect(mockSetActiveTokenCategory).toHaveBeenCalledWith(expect.any(String), 'predictions')
+    expect(mockClearActiveTokenCategory).toHaveBeenCalledWith(expect.any(String))
   })
 
   it('analyze in non-demo mode sends POST to /predictions/analyze', async () => {

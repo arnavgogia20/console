@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,17 +13,24 @@ import (
 	"github.com/google/uuid"
 	"github.com/kubestellar/console/pkg/api/middleware"
 	"github.com/kubestellar/console/pkg/models"
+	"github.com/kubestellar/console/pkg/store"
 	"github.com/kubestellar/console/pkg/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
-// setupAuthTest creates a fresh Fiber app and an AuthHandler with a mock store
+// setupAuthTest creates a fresh Fiber app and an AuthHandler with a mock store.
+//
+// The handler runs in DevMode (GitHubClientID == "") so NewAuthHandler skips
+// the OAuth state cleanup goroutine entirely (#6125) — there is no goroutine
+// to leak. Tests that need a real-OAuth handler should instantiate it
+// directly and call t.Cleanup(handler.Stop).
 func setupAuthTest() (*fiber.App, *test.MockStore, *AuthHandler) {
 	app := fiber.New()
 	mockStore := new(test.MockStore)
 	cfg := AuthConfig{
-		GitHubClientID: "", // Trigger DevMode
+		GitHubClientID: "", // Trigger DevMode (also skips cleanup goroutine)
 		JWTSecret:      "test-secret",
 		FrontendURL:    "http://frontend",
 		DevMode:        true,
@@ -165,14 +173,27 @@ func TestRefreshToken(t *testing.T) {
 }
 
 func TestGitHubLogin_Redirects(t *testing.T) {
-	app, _, _ := setupAuthTest()
-	// Override config to simulate existing OAuth credentials
+	// Use a fresh fiber.App directly — setupAuthTest() creates a DevMode
+	// handler we don't need here, and discarding it would either leak the
+	// cleanup goroutine (if we forgot to Stop it) or noise the test (#6125).
+	app := fiber.New()
+	// Use a real SQLiteStore so the handler can persist the OAuth state
+	// (the in-memory map was replaced by a store-backed write in #6028).
+	dbPath := filepath.Join(t.TempDir(), "github-login.db")
+	s, err := store.NewSQLiteStore(dbPath)
+	require.NoError(t, err)
+	defer s.Close()
+	// Override config to simulate existing OAuth credentials. Because
+	// GitHubClientID is non-empty NewAuthHandler will start the cleanup
+	// goroutine — t.Cleanup(handler.Stop) terminates it before the test
+	// returns so each test exits cleanly.
 	cfg := AuthConfig{
 		GitHubClientID: "client-id",
 		GitHubSecret:   "secret",
 		BackendURL:     "http://backend",
 	}
-	handler := NewAuthHandler(nil, cfg)
+	handler := NewAuthHandler(s, cfg)
+	t.Cleanup(handler.Stop)
 	app.Get("/auth/github", handler.GitHubLogin)
 
 	req, _ := http.NewRequest("GET", "/auth/github", nil)
@@ -296,5 +317,201 @@ func TestClassifyExchangeError(t *testing.T) {
 	})
 }
 
+// TestGitHubCallback_RecoversFromValidCookieOnStateFailure covers #6064:
+// when CSRF state validation fails (stale OAuth tab, server restart that
+// cleared the in-memory state store, etc.) the callback must check whether
+// the request already carries a valid kc_auth cookie. If so, it should
+// redirect to "/" and preserve the live session instead of bouncing the
+// user to the error page and forcing a pointless re-login. If the cookie
+// is missing, expired, or signed with a different secret, the classic
+// error redirect still applies.
+func TestGitHubCallback_RecoversFromValidCookieOnStateFailure(t *testing.T) {
+	app, _, handler := setupAuthTest()
+	app.Get("/auth/callback", handler.GitHubCallback)
+
+	const (
+		validCookieLifetime = time.Hour
+		expiredCookieAge    = -1 * time.Hour
+	)
+
+	t.Run("valid cookie + invalid state redirects to /", func(t *testing.T) {
+		user := &models.User{ID: uuid.New(), GitHubLogin: "already-signed-in"}
+		cookieToken, err := handler.generateJWT(user)
+		assert.NoError(t, err)
+
+		req, _ := http.NewRequest("GET", "/auth/callback?code=123&state=bogus", nil)
+		req.AddCookie(&http.Cookie{Name: jwtCookieName, Value: cookieToken})
+
+		resp, err := app.Test(req, 5000)
+		assert.NoError(t, err)
+		assert.Equal(t, http.StatusTemporaryRedirect, resp.StatusCode)
+
+		loc, _ := resp.Location()
+		assert.Equal(t, "/", loc.Path,
+			"valid cookie should recover to frontend root, not error page")
+		assert.NotContains(t, loc.String(), "error=csrf_validation_failed",
+			"error page must not be used when a valid session cookie is present")
+	})
+
+	t.Run("missing cookie + invalid state redirects to error page", func(t *testing.T) {
+		req, _ := http.NewRequest("GET", "/auth/callback?code=123&state=bogus", nil)
+
+		resp, err := app.Test(req, 5000)
+		assert.NoError(t, err)
+		assert.Equal(t, http.StatusTemporaryRedirect, resp.StatusCode)
+
+		loc, _ := resp.Location()
+		assert.Contains(t, loc.String(), "error=csrf_validation_failed")
+	})
+
+	t.Run("expired cookie + invalid state redirects to error page", func(t *testing.T) {
+		// Cookie parses but is expired — the recovery path must NOT engage.
+		expiredClaims := middleware.UserClaims{
+			UserID:      uuid.New(),
+			GitHubLogin: "stale",
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(expiredCookieAge)),
+			},
+		}
+		expiredJWT := jwt.NewWithClaims(jwt.SigningMethodHS256, expiredClaims)
+		expiredSigned, _ := expiredJWT.SignedString([]byte("test-secret"))
+
+		req, _ := http.NewRequest("GET", "/auth/callback?code=123&state=bogus", nil)
+		req.AddCookie(&http.Cookie{Name: jwtCookieName, Value: expiredSigned})
+
+		resp, err := app.Test(req, 5000)
+		assert.NoError(t, err)
+		assert.Equal(t, http.StatusTemporaryRedirect, resp.StatusCode)
+
+		loc, _ := resp.Location()
+		assert.Contains(t, loc.String(), "error=csrf_validation_failed",
+			"expired cookie must not trigger the #6064 recovery path")
+	})
+
+	t.Run("cookie signed with wrong secret + invalid state redirects to error page", func(t *testing.T) {
+		// Cookie is non-expired but signed with a different secret — ParseJWT
+		// must reject it, so the recovery path must NOT engage.
+		forgedClaims := middleware.UserClaims{
+			UserID:      uuid.New(),
+			GitHubLogin: "forged",
+			RegisteredClaims: jwt.RegisteredClaims{
+				ExpiresAt: jwt.NewNumericDate(time.Now().Add(validCookieLifetime)),
+			},
+		}
+		forgedJWT := jwt.NewWithClaims(jwt.SigningMethodHS256, forgedClaims)
+		forgedSigned, _ := forgedJWT.SignedString([]byte("not-the-real-secret"))
+
+		req, _ := http.NewRequest("GET", "/auth/callback?code=123&state=bogus", nil)
+		req.AddCookie(&http.Cookie{Name: jwtCookieName, Value: forgedSigned})
+
+		resp, err := app.Test(req, 5000)
+		assert.NoError(t, err)
+		assert.Equal(t, http.StatusTemporaryRedirect, resp.StatusCode)
+
+		loc, _ := resp.Location()
+		assert.Contains(t, loc.String(), "error=csrf_validation_failed",
+			"wrong-secret cookie must not trigger the #6064 recovery path")
+	})
+
+	t.Run("empty state + valid cookie still recovers to /", func(t *testing.T) {
+		// state missing entirely (not just invalid) should also recover.
+		user := &models.User{ID: uuid.New(), GitHubLogin: "empty-state"}
+		cookieToken, err := handler.generateJWT(user)
+		assert.NoError(t, err)
+
+		req, _ := http.NewRequest("GET", "/auth/callback?code=123", nil)
+		req.AddCookie(&http.Cookie{Name: jwtCookieName, Value: cookieToken})
+
+		resp, err := app.Test(req, 5000)
+		assert.NoError(t, err)
+		assert.Equal(t, http.StatusTemporaryRedirect, resp.StatusCode)
+
+		loc, _ := resp.Location()
+		assert.Equal(t, "/", loc.Path)
+	})
+}
+
 // We cannot easily test successful GitHubCallback flow without mocking oauth lib
 // or doing extensive interface extraction, but we covered the error paths above.
+
+// newRealStoreAuthHandler creates an AuthHandler backed by a real SQLiteStore
+// so tests can exercise persistence behavior (#6028). Using a real store
+// instead of the mock lets us verify the end-to-end OAuth state round-trip
+// without wiring up testify expectations for every internal call.
+func newRealStoreAuthHandler(t *testing.T) (*AuthHandler, store.Store) {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "auth-test.db")
+	s, err := store.NewSQLiteStore(dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	cfg := AuthConfig{
+		GitHubClientID: "client-id",
+		GitHubSecret:   "secret",
+		JWTSecret:      "test-secret",
+		FrontendURL:    "http://frontend",
+		BackendURL:     "http://backend",
+	}
+	return NewAuthHandler(s, cfg), s
+}
+
+// TestOAuthStatePersistence_RoundTrip verifies that a state stored via the
+// handler helper can be consumed via the handler helper on the happy path.
+func TestOAuthStatePersistence_RoundTrip(t *testing.T) {
+	h, _ := newRealStoreAuthHandler(t)
+
+	const state = "round-trip-state"
+	require.NoError(t, h.storeOAuthState(state))
+
+	ok := h.validateAndConsumeOAuthState(state)
+	assert.True(t, ok, "freshly stored state should validate")
+
+	// Single-use: a second call must fail.
+	ok = h.validateAndConsumeOAuthState(state)
+	assert.False(t, ok, "consumed state should not validate twice")
+}
+
+// TestOAuthStatePersistence_SurvivesRestart simulates the #6028 scenario:
+// the backend restarts between /auth/login and /auth/callback. The user's
+// state was written to the persistent store on /login, and after a restart
+// the callback can still consume it successfully. With the old in-memory
+// map this test would fail with csrf_validation_failed.
+func TestOAuthStatePersistence_SurvivesRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "restart.db")
+
+	// First "process" — /auth/login stores the state.
+	s1, err := store.NewSQLiteStore(dbPath)
+	require.NoError(t, err)
+	h1 := NewAuthHandler(s1, AuthConfig{
+		GitHubClientID: "client-id",
+		GitHubSecret:   "secret",
+		JWTSecret:      "test-secret",
+		FrontendURL:    "http://frontend",
+		BackendURL:     "http://backend",
+	})
+	const state = "state-across-restart"
+	require.NoError(t, h1.storeOAuthState(state))
+	require.NoError(t, s1.Close())
+
+	// Second "process" — /auth/callback consumes the state after restart.
+	s2, err := store.NewSQLiteStore(dbPath)
+	require.NoError(t, err)
+	defer s2.Close()
+	h2 := NewAuthHandler(s2, AuthConfig{
+		GitHubClientID: "client-id",
+		GitHubSecret:   "secret",
+		JWTSecret:      "test-secret",
+		FrontendURL:    "http://frontend",
+		BackendURL:     "http://backend",
+	})
+
+	ok := h2.validateAndConsumeOAuthState(state)
+	assert.True(t, ok, "OAuth state must survive backend restart (#6028)")
+}
+
+// TestOAuthStatePersistence_InvalidStateRejected ensures unknown states
+// continue to fail CSRF validation — no regression in the rejection path.
+func TestOAuthStatePersistence_InvalidStateRejected(t *testing.T) {
+	h, _ := newRealStoreAuthHandler(t)
+	assert.False(t, h.validateAndConsumeOAuthState("never-issued"))
+}

@@ -88,7 +88,7 @@ function SearchResultsPanel({
   let flatIndex = 0
 
   return (
-    <div className="absolute top-full left-0 right-0 mt-2 bg-card border border-border rounded-lg shadow-xl overflow-hidden z-[60]">
+    <div className="absolute top-full left-0 right-0 mt-2 bg-card border border-border rounded-lg shadow-xl overflow-hidden z-dropdown">
       {flatResults.length > 0 ? (
         <div ref={resultsRef} className="py-1 max-h-96 overflow-y-auto">
           {CATEGORY_ORDER.map(cat => {
@@ -318,9 +318,20 @@ export function SearchDropdown() {
   // Keyboard navigation
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      // Skip if this instance's container is not visible — prevents duplicate
+      // handlers when SearchDropdown is mounted in both desktop and mobile slots (#5711)
+      if (searchRef.current && searchRef.current.offsetParent === null) return
+
       // Open search with Cmd+K
       if ((event.metaKey || event.ctrlKey) && event.key === 'k') {
         event.preventDefault()
+        // #6225: stop propagation so FloatingDashboardActions's bubble-phase
+        // listener does not also fire on the same Ctrl+K — without this,
+        // both the search dropdown and the dashboard actions menu opened
+        // simultaneously and required two Escape presses to close. Paired
+        // with the `capture: true` on the addEventListener call below so
+        // this listener wins regardless of registration order.
+        event.stopPropagation()
         inputRef.current?.focus()
         openSearch()
         emitGlobalSearchOpened('keyboard')
@@ -352,8 +363,12 @@ export function SearchDropdown() {
       }
     }
 
-    document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
+    // #6225: capture phase so this listener fires BEFORE bubble-phase
+    // handlers (e.g. FloatingDashboardActions) — paired with the
+    // event.stopPropagation() inside the Ctrl+K branch above. The third
+    // arg must match between addEventListener and removeEventListener.
+    document.addEventListener('keydown', handleKeyDown, true)
+    return () => document.removeEventListener('keydown', handleKeyDown, true)
   }, [isSearchOpen, isResultsPanelActive, selectedIndex, handleSelect, handleAskAI, openSearch, closeSearch])
 
   // Reset selected index when results change

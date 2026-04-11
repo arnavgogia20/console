@@ -49,6 +49,9 @@ import type { Card, DashboardData } from './dashboardUtils'
 import { isLocalOnlyCard, mapVisualizationToCardType, getDefaultCardSize, getDemoCards } from './dashboardUtils'
 import { useDashboardReset } from '../../hooks/useDashboardReset'
 import { useDashboardUndoRedo } from '../../hooks/useUndoRedo'
+
+/** Auto-refresh interval (ms) for dashboard data polling */
+const AUTO_REFRESH_INTERVAL_MS = 30_000
 import { WelcomeCard } from './WelcomeCard'
 
 import { PostConnectBanner } from './PostConnectBanner'
@@ -262,7 +265,7 @@ export function Dashboard() {
     if (autoRefresh && !isLoading) {
       autoRefreshIntervalRef.current = setInterval(() => {
         refetch()
-      }, 30000) // 30 seconds
+      }, AUTO_REFRESH_INTERVAL_MS)
     }
     return () => {
       if (autoRefreshIntervalRef.current) {
@@ -1075,12 +1078,20 @@ export function Dashboard() {
         onDragCancel={handleDragCancel}
       >
         <SortableContext items={localCards.map(c => c.id)} strategy={rectSortingStrategy}>
+          {/*
+            auto-rows-min lets rows shrink to their content so a collapsed
+            card (which only shows its header) does not leave a tall empty
+            grid row behind it (#6072). Each non-collapsed sortable card
+            sets its own `minHeight` inline to preserve the legacy expanded
+            baseline height. `grid-flow-dense` allows later cards to
+            backfill empty cells freed up by collapsed neighbours.
+          */}
           <div
             data-testid="dashboard-cards-grid"
             data-tour="dashboard"
             role="grid"
             aria-label="Dashboard cards"
-            className={`grid grid-cols-1 md:grid-cols-12 gap-2 auto-rows-[minmax(180px,auto)] ${showDragHint ? 'animate-shimmy' : ''}`}
+            className={`grid grid-cols-1 md:grid-cols-12 gap-2 auto-rows-min grid-flow-dense ${showDragHint ? 'animate-shimmy' : ''}`}
           >
             {localCards.map((card, index) => (
               <SortableCard

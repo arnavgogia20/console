@@ -64,15 +64,34 @@ vi.mock('../../../lib/cards/cardHooks', () => ({
   commonComparators: { string: () => () => 0, number: () => () => 0, statusOrder: () => () => 0, date: () => () => 0, boolean: () => () => 0 },
 }))
 
+// #6269: capture RefreshIndicator props so the freshness-indicator
+// contract (oldest-of-two timestamps + demo-mode null + combined
+// isRefreshing) can be asserted directly on the rendered indicator,
+// not just on the card-level useCardLoadingState call.
+const refreshIndicatorProps = vi.fn()
+vi.mock('../../ui/RefreshIndicator', () => ({
+  RefreshIndicator: (props: { isRefreshing: boolean; lastUpdated: Date | null }) => {
+    refreshIndicatorProps(props)
+    return null
+  },
+}))
+
 import { NetworkOverview } from '../NetworkOverview'
 
 describe('NetworkOverview', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mockUseDemoMode.mockReturnValue({ isDemoMode: true, toggleDemoMode: vi.fn(), setDemoMode: vi.fn() })
+    // #6276+: default to "live mode, nothing cached from demo". Tests
+    // that exercise demo behavior override BOTH `useDemoMode().isDemoMode`
+    // AND the relevant cache hook's `isDemoFallback` to match the
+    // combined state `useCache` produces in production. The exact
+    // conditions under which `useCache` flips `isDemoFallback` are in
+    // `web/src/lib/cache/index.ts` around line 1324 — don't try to
+    // summarize them here (the summary keeps drifting out of sync).
+    mockUseDemoMode.mockReturnValue({ isDemoMode: false, toggleDemoMode: vi.fn(), setDemoMode: vi.fn() })
     mockUseCardLoadingState.mockReturnValue({ showSkeleton: false, showEmptyState: false, hasData: true, isRefreshing: false })
     mockServices.mockReturnValue({ services: [], isLoading: false, isRefreshing: false, isDemoFallback: false, isFailed: false, consecutiveFailures: 0, error: null, lastRefresh: Date.now() })
-    mockUseClusters.mockReturnValue({ clusters: [], deduplicatedClusters: [], isLoading: false, isRefreshing: false, error: null, lastRefresh: Date.now() })
+    mockUseClusters.mockReturnValue({ clusters: [], deduplicatedClusters: [], isLoading: false, isRefreshing: false, error: null, lastRefresh: new Date() })
     mockDrillDown.mockReturnValue({ drillToNetwork: vi.fn() })
   })
 
@@ -102,7 +121,10 @@ describe('NetworkOverview', () => {
   })
 
   it('renders correctly in demo mode', () => {
+    // #6278: flip BOTH demo flags so the mock state matches what
+    // production actually produces (see beforeEach comment).
     mockUseDemoMode.mockReturnValue({ isDemoMode: true, toggleDemoMode: vi.fn(), setDemoMode: vi.fn() })
+    mockServices.mockReturnValue({ services: [], isLoading: false, isRefreshing: false, isDemoFallback: true, isFailed: false, consecutiveFailures: 0, error: null, lastRefresh: Date.now() })
     const { container } = render(<NetworkOverview />)
     expect(container).toBeTruthy()
   })
@@ -129,7 +151,7 @@ describe('NetworkOverview', () => {
   it('renders with cluster data available', () => {
     mockUseClusters.mockReturnValue({
       clusters: [{ name: 'prod-cluster', healthy: true, reachable: true, nodeCount: 3, podCount: 10, cpuCores: 8, memoryGB: 16, cpuRequestsCores: 4, memoryRequestsGB: 8 }], deduplicatedClusters: [{ name: 'prod-cluster', healthy: true, reachable: true, nodeCount: 3, podCount: 10, cpuCores: 8, memoryGB: 16, cpuRequestsCores: 4, memoryRequestsGB: 8 }],
-      isLoading: false, isRefreshing: false, error: null, lastRefresh: Date.now(),
+      isLoading: false, isRefreshing: false, error: null, lastRefresh: new Date(),
     })
     const { container } = render(<NetworkOverview />)
     expect(container).toBeTruthy()
@@ -141,4 +163,59 @@ describe('NetworkOverview', () => {
     expect(mockUseCardLoadingState).toHaveBeenCalled()
   })
 
+  // #6267: regression coverage for the freshness-indicator wiring
+  // introduced in #6266 (oldest-of-two timestamps + demo-mode suppression
+  // + clustersRefreshing in card-level state).
+  describe('freshness indicator wiring (#6265, #6267, #6269)', () => {
+    it('reports clustersRefreshing OR servicesRefreshing to useCardLoadingState', () => {
+      // Services not refreshing, clusters refreshing → card state must show isRefreshing=true
+      mockServices.mockReturnValue({ services: [], isLoading: false, isRefreshing: false, isDemoFallback: false, isFailed: false, consecutiveFailures: 0, error: null, lastRefresh: Date.now() })
+      mockUseClusters.mockReturnValue({ clusters: [], deduplicatedClusters: [], isLoading: false, isRefreshing: true, error: null, lastRefresh: new Date() })
+      render(<NetworkOverview />)
+      const lastCall = mockUseCardLoadingState.mock.calls[mockUseCardLoadingState.mock.calls.length - 1][0]
+      expect(lastCall.isRefreshing).toBe(true)
+    })
+
+    it('reports isRefreshing=false when neither source is refreshing', () => {
+      mockServices.mockReturnValue({ services: [], isLoading: false, isRefreshing: false, isDemoFallback: false, isFailed: false, consecutiveFailures: 0, error: null, lastRefresh: Date.now() })
+      mockUseClusters.mockReturnValue({ clusters: [], deduplicatedClusters: [], isLoading: false, isRefreshing: false, error: null, lastRefresh: new Date() })
+      render(<NetworkOverview />)
+      const lastCall = mockUseCardLoadingState.mock.calls[mockUseCardLoadingState.mock.calls.length - 1][0]
+      expect(lastCall.isRefreshing).toBe(false)
+    })
+
+    // #6269: assert directly on RefreshIndicator props rather than just
+    // the card-level isRefreshing — the previous tests only proved the
+    // card animation flag was correct, not the timestamp/null contract.
+    it('passes the OLDER of clusters and services lastRefresh to RefreshIndicator', () => {
+      const OLDER = 1_000_000_000_000
+      const NEWER = 2_000_000_000_000
+      // #6271: useClusters().lastRefresh is `Date | null` per shared.ts,
+      // useCachedServices().lastRefresh is numeric epoch — mocks must
+      // match the real types, otherwise the source's normalization
+      // path isn't actually exercised.
+      mockServices.mockReturnValue({ services: [], isLoading: false, isRefreshing: false, isDemoFallback: false, isFailed: false, consecutiveFailures: 0, error: null, lastRefresh: NEWER })
+      mockUseClusters.mockReturnValue({ clusters: [], deduplicatedClusters: [], isLoading: false, isRefreshing: false, error: null, lastRefresh: new Date(OLDER) })
+      render(<NetworkOverview />)
+      const props = refreshIndicatorProps.mock.calls[refreshIndicatorProps.mock.calls.length - 1][0]
+      expect(props.lastUpdated).toEqual(new Date(OLDER))
+    })
+
+    it('passes null lastUpdated when isDemoFallback is true (regardless of lastRefresh)', () => {
+      // Cache holds a stale lastRefresh from a prior live session — must be hidden in demo mode
+      mockServices.mockReturnValue({ services: [], isLoading: false, isRefreshing: false, isDemoFallback: true, isFailed: false, consecutiveFailures: 0, error: null, lastRefresh: Date.now() })
+      mockUseClusters.mockReturnValue({ clusters: [], deduplicatedClusters: [], isLoading: false, isRefreshing: false, error: null, lastRefresh: new Date() })
+      render(<NetworkOverview />)
+      const props = refreshIndicatorProps.mock.calls[refreshIndicatorProps.mock.calls.length - 1][0]
+      expect(props.lastUpdated).toBeNull()
+    })
+
+    it('passes isRefreshing=true to RefreshIndicator when clusters source is refreshing', () => {
+      mockServices.mockReturnValue({ services: [], isLoading: false, isRefreshing: false, isDemoFallback: false, isFailed: false, consecutiveFailures: 0, error: null, lastRefresh: Date.now() })
+      mockUseClusters.mockReturnValue({ clusters: [], deduplicatedClusters: [], isLoading: false, isRefreshing: true, error: null, lastRefresh: new Date() })
+      render(<NetworkOverview />)
+      const props = refreshIndicatorProps.mock.calls[refreshIndicatorProps.mock.calls.length - 1][0]
+      expect(props.isRefreshing).toBe(true)
+    })
+  })
 })

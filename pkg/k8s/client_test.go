@@ -741,6 +741,162 @@ func TestGetServices(t *testing.T) {
 	}
 }
 
+// TestGetServices_EndpointsAndLoadBalancer verifies the fix for
+// issue #6150 (endpoint count is based on the actual core/v1 Endpoints
+// object, not the number of services) and issue #6153 (LoadBalancer
+// services with no ingress populated are reported as Provisioning).
+func TestGetServices_EndpointsAndLoadBalancer(t *testing.T) {
+	m, _ := NewMultiClusterClient("")
+
+	// Service with two ready backend addresses across two subsets.
+	svcWithEndpoints := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "with-eps", Namespace: "default"},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{{Port: 80}},
+		},
+	}
+	epsForSvc := &corev1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{Name: "with-eps", Namespace: "default"},
+		Subsets: []corev1.EndpointSubset{
+			{Addresses: []corev1.EndpointAddress{{IP: "10.0.0.1"}, {IP: "10.0.0.2"}}},
+			{Addresses: []corev1.EndpointAddress{{IP: "10.0.0.3"}}},
+		},
+	}
+
+	// Service with a matching Endpoints object that has zero addresses.
+	svcNoPods := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "no-pods", Namespace: "default"},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeClusterIP,
+			Ports: []corev1.ServicePort{{Port: 80}},
+		},
+	}
+	epsNoPods := &corev1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{Name: "no-pods", Namespace: "default"},
+		Subsets:    nil,
+	}
+
+	// LoadBalancer service that is still being provisioned (no ingress).
+	svcLBPending := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "lb-pending", Namespace: "default"},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{{Port: 80}},
+		},
+	}
+
+	// LoadBalancer service that has an ingress IP assigned.
+	svcLBReady := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "lb-ready", Namespace: "default"},
+		Spec: corev1.ServiceSpec{
+			Type:  corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{{Port: 80}},
+		},
+		Status: corev1.ServiceStatus{
+			LoadBalancer: corev1.LoadBalancerStatus{
+				Ingress: []corev1.LoadBalancerIngress{{IP: "203.0.113.9"}},
+			},
+		},
+	}
+
+	fakeCS := k8sfake.NewSimpleClientset(
+		svcWithEndpoints, epsForSvc,
+		svcNoPods, epsNoPods,
+		svcLBPending,
+		svcLBReady,
+	)
+	m.clients["c1"] = fakeCS
+
+	svcs, err := m.GetServices(context.Background(), "c1", "default")
+	if err != nil {
+		t.Fatalf("GetServices failed: %v", err)
+	}
+
+	byName := map[string]Service{}
+	for _, s := range svcs {
+		byName[s.Name] = s
+	}
+
+	// Expected endpoint counts per the fix for #6150.
+	const (
+		expectedWithEpsCount = 3 // 2 + 1 addresses across two subsets
+		expectedNoPodsCount  = 0
+	)
+	if got := byName["with-eps"].Endpoints; got != expectedWithEpsCount {
+		t.Errorf("with-eps: expected %d endpoints, got %d", expectedWithEpsCount, got)
+	}
+	if got := byName["no-pods"].Endpoints; got != expectedNoPodsCount {
+		t.Errorf("no-pods: expected %d endpoints, got %d", expectedNoPodsCount, got)
+	}
+
+	// Fix for #6153: LB without ingress = Provisioning, blank externalIP.
+	if got := byName["lb-pending"].LBStatus; got != LBStatusProvisioning {
+		t.Errorf("lb-pending: expected LBStatus %q, got %q", LBStatusProvisioning, got)
+	}
+	if got := byName["lb-pending"].ExternalIP; got != "" {
+		t.Errorf("lb-pending: expected empty ExternalIP, got %q", got)
+	}
+	if got := byName["lb-ready"].LBStatus; got != LBStatusReady {
+		t.Errorf("lb-ready: expected LBStatus %q, got %q", LBStatusReady, got)
+	}
+	if got := byName["lb-ready"].ExternalIP; got != "203.0.113.9" {
+		t.Errorf("lb-ready: expected ExternalIP 203.0.113.9, got %q", got)
+	}
+}
+
+// TestGetServices_PortDetailsAndSelector verifies issues #6163
+// (port names surfaced via PortDetails) and #6164/#6166 (selector
+// exposed so the frontend can detect orphaned / misconfigured services).
+func TestGetServices_PortDetailsAndSelector(t *testing.T) {
+	m, _ := NewMultiClusterClient("")
+
+	const (
+		httpPort       = int32(80)
+		metricsPort    = int32(9090)
+		expectedSelKey = "app"
+		expectedSelVal = "web"
+	)
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "with-names", Namespace: "default"},
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: map[string]string{expectedSelKey: expectedSelVal},
+			Ports: []corev1.ServicePort{
+				{Name: "http", Port: httpPort, Protocol: corev1.ProtocolTCP},
+				{Name: "metrics", Port: metricsPort, Protocol: corev1.ProtocolTCP},
+			},
+		},
+	}
+
+	fakeCS := k8sfake.NewSimpleClientset(svc)
+	m.clients["c1"] = fakeCS
+
+	svcs, err := m.GetServices(context.Background(), "c1", "default")
+	if err != nil {
+		t.Fatalf("GetServices failed: %v", err)
+	}
+	if len(svcs) != 1 {
+		t.Fatalf("expected 1 service, got %d", len(svcs))
+	}
+	got := svcs[0]
+
+	const expectedPortCount = 2
+	if len(got.PortDetails) != expectedPortCount {
+		t.Fatalf("expected %d port details, got %d", expectedPortCount, len(got.PortDetails))
+	}
+	if got.PortDetails[0].Name != "http" || got.PortDetails[0].Port != httpPort {
+		t.Errorf("port[0]: expected http/%d, got %s/%d", httpPort, got.PortDetails[0].Name, got.PortDetails[0].Port)
+	}
+	if got.PortDetails[1].Name != "metrics" || got.PortDetails[1].Port != metricsPort {
+		t.Errorf("port[1]: expected metrics/%d, got %s/%d", metricsPort, got.PortDetails[1].Name, got.PortDetails[1].Port)
+	}
+	if got.Selector[expectedSelKey] != expectedSelVal {
+		t.Errorf("selector: expected %s=%s, got %v", expectedSelKey, expectedSelVal, got.Selector)
+	}
+}
+
 func TestGetJobs(t *testing.T) {
 	m, _ := NewMultiClusterClient("")
 

@@ -5,11 +5,13 @@ import { useDrillDownActions } from '../../hooks/useDrillDown'
 import { ClusterBadge } from '../ui/ClusterBadge'
 import { StatusBadge } from '../ui/StatusBadge'
 import { CardClusterFilter, CardSearchInput } from '../../lib/cards/CardComponents'
+import { RefreshIndicator } from '../ui/RefreshIndicator'
 import { CardControls } from '../ui/CardControls'
 import { Pagination } from '../ui/Pagination'
 import { Skeleton } from '../ui/Skeleton'
 import { useCardData, commonComparators } from '../../lib/cards/cardHooks'
 import { useCardLoadingState } from './CardDataContext'
+import { DynamicCardErrorBoundary } from './DynamicCardErrorBoundary'
 import { useTranslation } from 'react-i18next'
 
 interface GPUNamespaceAllocationsProps {
@@ -49,10 +51,15 @@ const NAMESPACE_SORT_COMPARATORS: Record<SortByOption, (a: NamespaceGPUAllocatio
   namespace: commonComparators.string<NamespaceGPUAllocation>('namespace'),
   podCount: (a, b) => a.podCount - b.podCount }
 
-export function GPUNamespaceAllocations({ config: _config }: GPUNamespaceAllocationsProps) {
+// #6216: wrapped at the bottom of the file in DynamicCardErrorBoundary so
+// a runtime error in the 274-line component doesn't crash the dashboard.
+function GPUNamespaceAllocationsInternal({ config: _config }: GPUNamespaceAllocationsProps) {
   const { t } = useTranslation(['cards', 'common'])
-  const { nodes: gpuNodes, isLoading: gpuLoading, isRefreshing: gpuRefreshing, isDemoFallback: gpuNodesDemoFallback, isFailed: gpuFailed, consecutiveFailures: gpuFailures } = useCachedGPUNodes()
-  const { pods: allPods, isLoading: podsLoading, isRefreshing: podsRefreshing, isDemoFallback: podsDemoFallback, isFailed: podsFailed, consecutiveFailures: podsFailures } = useCachedAllPods()
+  // #6217: destructure lastRefresh from both hooks to power a freshness
+  // indicator. Use the OLDER of the two timestamps so the indicator
+  // reflects the staler half of the data the user is looking at.
+  const { nodes: gpuNodes, isLoading: gpuLoading, isRefreshing: gpuRefreshing, isDemoFallback: gpuNodesDemoFallback, isFailed: gpuFailed, consecutiveFailures: gpuFailures, lastRefresh: gpuLastRefresh } = useCachedGPUNodes()
+  const { pods: allPods, isLoading: podsLoading, isRefreshing: podsRefreshing, isDemoFallback: podsDemoFallback, isFailed: podsFailed, consecutiveFailures: podsFailures, lastRefresh: podsLastRefresh } = useCachedAllPods()
   const { drillToGPUNamespace } = useDrillDownActions()
 
   // Combine all isDemoFallback values from cached hooks
@@ -169,6 +176,24 @@ export function GPUNamespaceAllocations({ config: _config }: GPUNamespaceAllocat
           <StatusBadge color="purple">
             {t('gpuNamespaceAllocations.gpusAcrossNamespaces', { gpus: totalGPUs, count: namespaceAllocations.length })}
           </StatusBadge>
+          {/* #6217: freshness indicator. Use the OLDER of the two cache
+              timestamps so the user sees the staler half of the data.
+              #6244: explicit `typeof === 'number'` checks (truthy comparisons
+              would treat a `0` epoch timestamp as missing). */}
+          <RefreshIndicator
+            isRefreshing={gpuRefreshing || podsRefreshing}
+            lastUpdated={(() => {
+              const gp = typeof gpuLastRefresh === 'number' ? gpuLastRefresh : null
+              const po = typeof podsLastRefresh === 'number' ? podsLastRefresh : null
+              if (gp !== null && po !== null) return new Date(Math.min(gp, po))
+              if (gp !== null) return new Date(gp)
+              if (po !== null) return new Date(po)
+              return null
+            })()}
+            size="sm"
+            showLabel={true}
+            staleThresholdMinutes={5}
+          />
         </div>
         <div className="flex items-center gap-2">
           {filters.localClusterFilter && filters.localClusterFilter.length > 0 && (
@@ -270,5 +295,13 @@ export function GPUNamespaceAllocations({ config: _config }: GPUNamespaceAllocat
         </div>
       )}
     </div>
+  )
+}
+
+export function GPUNamespaceAllocations(props: GPUNamespaceAllocationsProps) {
+  return (
+    <DynamicCardErrorBoundary cardId="GPUNamespaceAllocations">
+      <GPUNamespaceAllocationsInternal {...props} />
+    </DynamicCardErrorBoundary>
   )
 }

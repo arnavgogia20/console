@@ -662,12 +662,13 @@ export function ConsoleOfflineDetectionCard(_props: ConsoleMissionCardProps) {
     setCurrentPage(1)
   }, [search, localClusterFilter, sortField])
 
-  // Ensure current page is valid
+  // Ensure current page is valid (#5762).
+  // Only depend on totalPages — including currentPage risks infinite loop.
   useEffect(() => {
-    if (currentPage > totalPages) {
-      setCurrentPage(Math.max(1, totalPages))
+    if (totalPages > 0 && currentPage > totalPages) {
+      setCurrentPage(totalPages)
     }
-  }, [currentPage, totalPages])
+  }, [totalPages]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleClusterFilter = (cluster: string) => {
     setLocalClusterFilter(prev =>
@@ -781,16 +782,16 @@ export function ConsoleOfflineDetectionCard(_props: ConsoleMissionCardProps) {
     const filteredOfflineItems = isFiltered
       ? sortedItems.filter(i => i.category === 'offline')
       : unifiedItems.filter(i => i.category === 'offline')
-    const filteredOfflineNodes = filteredOfflineItems.map(i => i.nodeData!).filter(Boolean)
+    const filteredOfflineNodes = filteredOfflineItems.map(i => i.nodeData).filter((n): n is NonNullable<typeof n> => !!n)
     const filteredGpuIssuesList = isFiltered
-      ? sortedItems.filter(i => i.category === 'gpu' && i.gpuData).map(i => i.gpuData!)
+      ? sortedItems.filter(i => i.category === 'gpu' && i.gpuData).map(i => i.gpuData) as typeof gpuIssues
       : gpuIssues
     const filteredPredictedRisks = isFiltered
-      ? sortedItems.filter(i => i.category === 'prediction' && i.predictionData).map(i => i.predictionData!)
+      ? sortedItems.filter(i => i.category === 'prediction' && i.predictionData).map(i => i.predictionData) as typeof predictedRisks
       : predictedRisks
 
     // Include root cause analysis in the summary
-    const nodesSummary = filteredOfflineItems.map(item => {
+    const nodesSummary = filteredOfflineItems.filter(item => item.nodeData).map(item => {
       const n = item.nodeData!
       const rootCause = item.rootCause
       let line = `- Node ${n.name} (${n.cluster || 'unknown'}): Status=${n.unschedulable ? 'Cordoned' : n.status}`
@@ -915,9 +916,11 @@ Please:
         <div
           className={cn(
             'p-2 rounded-lg border',
-            totalPredicted > 0
+            totalPredicted > 0 && aiEnabled && !isAnalyzing
               ? 'bg-blue-500/10 border-blue-500/20 cursor-pointer hover:bg-blue-500/20 transition-colors'
-              : 'bg-green-500/10 border-green-500/20 cursor-default'
+              : totalPredicted > 0
+                ? 'bg-blue-500/10 border-blue-500/20 cursor-default'
+                : 'bg-green-500/10 border-green-500/20 cursor-default'
           )}
           onClick={aiEnabled && !isAnalyzing ? () => triggerAIAnalysis() : undefined}
           title={`Predictive Failure Detection:

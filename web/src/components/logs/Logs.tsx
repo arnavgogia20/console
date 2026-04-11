@@ -11,7 +11,13 @@ import { RotatingTip } from '../ui/RotatingTip'
 const LOGS_CARDS_KEY = 'kubestellar-logs-cards'
 
 // Default cards for the logs dashboard
+//
+// Fixes #6045: the Logs dashboard historically only surfaced Kubernetes
+// Events (via `useCachedEvents()`).  The new `pod_logs` card wires the
+// existing `/api/mcp/pods/logs` backend endpoint to the dashboard so users
+// can actually tail container logs — not just events — from this page.
 const DEFAULT_LOGS_CARDS = [
+  { type: 'pod_logs', title: 'Pod Logs', position: { w: 12, h: 4 } },
   { type: 'event_stream', title: 'Event Stream', position: { w: 12, h: 4 } },
   { type: 'namespace_events', title: 'Namespace Events', position: { w: 6, h: 3 } },
   { type: 'events_timeline', title: 'Events Timeline', position: { w: 6, h: 3 } },
@@ -53,7 +59,8 @@ export function Logs() {
   const currentWarningCount = filteredWarningEvents.length
   const currentNormalCount = filteredEvents.filter(e => e.type === 'Normal').length
   const currentErrorCount = filteredEvents.filter(e =>
-    e.type === 'Warning' && (e.reason?.toLowerCase().includes('error') || e.reason?.toLowerCase().includes('failed'))
+    e.type === 'Error' ||
+    (e.type === 'Warning' && (e.reason?.toLowerCase().includes('error') || e.reason?.toLowerCase().includes('failed')))
   ).length
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000)
   const currentRecentCount = filteredEvents.filter(e => {
@@ -119,7 +126,7 @@ export function Logs() {
       isLoading={isLoading}
       isRefreshing={isRefreshing}
       lastUpdated={lastUpdated}
-      hasData={reachableClusters.length > 0}
+      hasData={reachableClusters.length > 0 || filteredEvents.length > 0}
       emptyState={{
         title: 'Logs & Events Dashboard',
         description: 'Add cards to monitor Kubernetes events, application logs, and system messages across your clusters.' }}

@@ -15,6 +15,16 @@ interface Props {
 
 type TabType = 'overview' | 'data' | 'describe' | 'yaml'
 
+// #6231: the regex-based maskSecretYaml that used to live here had two
+// real bugs (block-scalar handling, false bundle-bloat claim about
+// js-yaml). Replaced by a shared js-yaml-based helper in lib/yamlMask.
+// Re-exported here for backward compat with any importer that might
+// still reference SecretDrillDown.maskSecretYaml; new code should
+// import maskKubernetesYamlData from '../../../lib/yamlMask' directly.
+import { maskKubernetesYamlData } from '../../../lib/yamlMask'
+/** @deprecated use `maskKubernetesYamlData` from `lib/yamlMask` */
+export const maskSecretYaml = maskKubernetesYamlData
+
 export function SecretDrillDown({ data }: Props) {
   const { t } = useTranslation()
   const cluster = data.cluster as string
@@ -34,6 +44,11 @@ export function SecretDrillDown({ data }: Props) {
   const [copiedField, setCopiedField] = useState<string | null>(null)
   const [showAllData, setShowAllData] = useState(false)
   const [revealedKeys, setRevealedKeys] = useState<Set<string>>(new Set())
+  // YAML tab reveal state — defaults to MASKED so the `data:` block doesn't
+  // leak base64-encoded secrets the moment a user clicks the YAML tab
+  // (#6209). Mirrors the per-key reveal pattern on the Data tab — explicit
+  // user action required to see secrets.
+  const [yamlRevealed, setYamlRevealed] = useState(false)
 
   // Helper to run kubectl commands
   const runKubectl = (args: string[]): Promise<string> => {
@@ -369,7 +384,15 @@ export function SecretDrillDown({ data }: Props) {
         )}
 
         {activeTab === 'yaml' && (
-          <div>
+          <div className="space-y-3">
+            {/* #6209: same warning the Data tab uses, so the YAML tab is no
+                longer the easy bypass for the per-key reveal model. */}
+            <div className="p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/20 text-sm text-yellow-400 flex items-center gap-2">
+              <Lock className="w-4 h-4" />
+              {yamlRevealed
+                ? 'Secret values are visible. Click the eye icon to mask.'
+                : 'Secret values are hidden by default. Click the eye icon to reveal.'}
+            </div>
             {yamlLoading ? (
               <div className="flex items-center justify-center py-12">
                 <Loader2 className="w-6 h-6 animate-spin text-primary" />
@@ -377,15 +400,35 @@ export function SecretDrillDown({ data }: Props) {
               </div>
             ) : yamlOutput ? (
               <div className="relative">
-                <button
-                  onClick={() => handleCopy('yaml', yamlOutput)}
-                  className="absolute top-2 right-2 px-2 py-1 rounded bg-secondary/50 text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
-                >
-                  {copiedField === 'yaml' ? <><Check className="w-3 h-3 text-green-400" /> Copied</> : <><Copy className="w-3 h-3" /> Copy</>}
-                </button>
-                <pre className="p-4 rounded-lg bg-black/50 border border-border overflow-auto max-h-[60vh] text-xs text-foreground font-mono whitespace-pre-wrap">
-                  {yamlOutput}
-                </pre>
+                {(() => {
+                  // Compute once per render so the Copy button puts the
+                  // SAME bytes onto the clipboard that the user is looking
+                  // at — masked when masked, raw when revealed (#6209).
+                  const displayedYaml = yamlRevealed ? yamlOutput : maskSecretYaml(yamlOutput)
+                  return (
+                    <>
+                      <div className="absolute top-2 right-2 flex items-center gap-1">
+                        <button
+                          onClick={() => setYamlRevealed(v => !v)}
+                          className="p-1 rounded bg-secondary/50 text-muted-foreground hover:text-foreground"
+                          aria-label={yamlRevealed ? 'Mask secret values' : 'Reveal secret values'}
+                          title={yamlRevealed ? 'Mask secret values' : 'Reveal secret values'}
+                        >
+                          {yamlRevealed ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                        </button>
+                        <button
+                          onClick={() => handleCopy('yaml', displayedYaml)}
+                          className="px-2 py-1 rounded bg-secondary/50 text-xs text-muted-foreground hover:text-foreground flex items-center gap-1"
+                        >
+                          {copiedField === 'yaml' ? <><Check className="w-3 h-3 text-green-400" /> Copied</> : <><Copy className="w-3 h-3" /> Copy</>}
+                        </button>
+                      </div>
+                      <pre className="p-4 rounded-lg bg-black/50 border border-border overflow-auto max-h-[60vh] text-xs text-foreground font-mono whitespace-pre-wrap">
+                        {displayedYaml}
+                      </pre>
+                    </>
+                  )
+                })()}
               </div>
             ) : (
               <div className="p-4 rounded-lg bg-yellow-500/10 border border-yellow-500/20 text-center">

@@ -152,6 +152,7 @@ async function exercisePagination(page: Page): Promise<void> {
     await btn.click().catch(() => {
       /* ignore click failures — button may have disappeared */
     })
+    // intentional delay: allow useLayoutEffect cascades from pagination to settle before checking for errors
     await page.waitForTimeout(PAGINATION_EXTRA_SETTLE_MS)
   }
 }
@@ -202,7 +203,11 @@ test.describe('React Render Error Detection', () => {
       })
 
       // Wait for cards to render and effects to settle
-      await page.waitForTimeout(CARD_SETTLE_MS)
+      try {
+        await page.waitForSelector('[data-card-type]', { timeout: CARD_SETTLE_MS })
+      } catch {
+        // Some routes may not have cards — continue to check for errors
+      }
 
       // Exercise pagination to trigger useLayoutEffect cascades
       if (route.hasPagination) {
@@ -228,6 +233,81 @@ test.describe('React Render Error Detection', () => {
       expect(
         routeErrors.length,
         `React render errors on ${route.path}:\n${routeErrors.map((e) => `  [${e.patternName}] ${e.message.slice(0, 200)}`).join('\n')}`
+      ).toBe(0)
+    })
+  }
+
+  // ── Mobile viewport tests ────────────────────────────────────────────────
+  // Mobile viewports trigger different code paths (useMobile, isNarrow) that
+  // can cause infinite render loops not caught by desktop-only tests.
+
+  const MOBILE_VIEWPORT = { width: 393, height: 852 }
+  const MOBILE_ROUTES = [
+    { path: '/', name: 'Home (mobile)' },
+    { path: '/clusters', name: 'Clusters (mobile)' },
+    { path: '/workloads', name: 'Workloads (mobile)' },
+    { path: '/deploy', name: 'Deploy (mobile)' },
+    { path: '/ai-ml', name: 'AI/ML (mobile)' },
+  ]
+
+  for (const route of MOBILE_ROUTES) {
+    test(`no React render errors on ${route.name} at mobile viewport`, async ({
+      page,
+    }) => {
+      await page.setViewportSize(MOBILE_VIEWPORT)
+
+      const routeErrors: ReactError[] = []
+
+      page.on('console', (msg: ConsoleMessage) => {
+        if (msg.type() !== 'error' && msg.type() !== 'warning') return
+        const text = msg.text()
+        const patternName = matchReactCriticalError(text)
+        if (patternName) {
+          routeErrors.push({ patternName, message: text.slice(0, 500), route: route.path })
+        }
+      })
+
+      page.on('pageerror', (err) => {
+        const text = err.stack || err.message
+        const patternName = matchReactCriticalError(text)
+        if (patternName) {
+          routeErrors.push({ patternName, message: text.slice(0, 500), route: route.path })
+        }
+      })
+
+      await setupDemoMode(page)
+      await page.goto(route.path, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS })
+      // Wait for cards to render and effects to settle
+      try {
+        await page.waitForSelector('[data-card-type]', { timeout: CARD_SETTLE_MS })
+      } catch {
+        // Some routes may not have cards at mobile viewport — continue
+      }
+
+      // Also check for error boundary rendering
+      const errorBoundary = await page.locator('text=This page encountered an error').count()
+      if (errorBoundary > 0) {
+        routeErrors.push({
+          patternName: 'Error boundary rendered',
+          message: 'Error boundary visible on page at mobile viewport',
+          route: route.path,
+        })
+      }
+
+      allErrors.push(...routeErrors)
+
+      if (routeErrors.length > 0) {
+        console.log(`[React Errors] ✗ ${route.name}: ${routeErrors.length} error(s)`)
+        for (const err of routeErrors) {
+          console.log(`  → ${err.patternName}: ${err.message.slice(0, 120)}`)
+        }
+      } else {
+        console.log(`[React Errors] ✓ ${route.name}: clean`)
+      }
+
+      expect(
+        routeErrors.length,
+        `React render errors on ${route.name}:\n${routeErrors.map((e) => `  [${e.patternName}] ${e.message.slice(0, 200)}`).join('\n')}`
       ).toBe(0)
     })
   }

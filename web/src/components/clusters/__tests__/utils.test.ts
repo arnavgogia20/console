@@ -16,6 +16,7 @@ import {
   isClusterTokenExpired,
   isClusterNetworkOffline,
   isClusterLoading,
+  getClusterHealthState,
   formatMetadata,
   loadClusterCards,
   saveClusterCards,
@@ -63,12 +64,116 @@ describe('isClusterHealthy', () => {
     expect(isClusterHealthy(makeCluster({ healthy: true }) as never)).toBe(true)
   })
 
-  it('returns true when nodeCount > 0', () => {
-    expect(isClusterHealthy(makeCluster({ healthy: false, nodeCount: 1 }) as never)).toBe(true)
+  it('returns false when healthy is explicitly false even with nodes', () => {
+    // PR #5449: healthy===false is authoritative — node presence does NOT override
+    expect(isClusterHealthy(makeCluster({ healthy: false, nodeCount: 1 }) as never)).toBe(false)
   })
 
   it('returns false when unhealthy with no nodes', () => {
     expect(isClusterHealthy(makeCluster({ healthy: false, nodeCount: 0 }) as never)).toBe(false)
+  })
+
+  it('returns false when healthy is undefined even with nodes (#5923)', () => {
+    // Previously this returned true because the helper fell back to
+    // nodeCount > 0 — but an unknown health signal should never be
+    // reported as healthy.
+    expect(
+      isClusterHealthy(
+        makeCluster({ healthy: undefined, nodeCount: 3 }) as never,
+      ),
+    ).toBe(false)
+  })
+})
+
+describe('getClusterHealthState', () => {
+  it('returns "healthy" when the flag is true', () => {
+    expect(getClusterHealthState(makeCluster({ healthy: true }) as never)).toBe(
+      'healthy',
+    )
+  })
+
+  it('returns "unhealthy" when the flag is explicitly false', () => {
+    expect(
+      getClusterHealthState(makeCluster({ healthy: false }) as never),
+    ).toBe('unhealthy')
+  })
+
+  it('returns "unreachable" when reachable is false', () => {
+    expect(
+      getClusterHealthState(makeCluster({ reachable: false }) as never),
+    ).toBe('unreachable')
+  })
+
+  it('returns "unreachable" when errorType indicates unreachability', () => {
+    expect(
+      getClusterHealthState(
+        makeCluster({ healthy: true, errorType: 'timeout' }) as never,
+      ),
+    ).toBe('unreachable')
+  })
+
+  it('returns "loading" while a refresh is in progress with no cached data', () => {
+    expect(
+      getClusterHealthState(
+        makeCluster({
+          healthy: undefined,
+          nodeCount: undefined,
+          refreshing: true,
+        }) as never,
+      ),
+    ).toBe('loading')
+  })
+
+  it('returns "unknown" when health is undefined and nothing is loading (#5923)', () => {
+    expect(
+      getClusterHealthState(
+        makeCluster({
+          healthy: undefined,
+          nodeCount: 3,
+          refreshing: false,
+        }) as never,
+      ),
+    ).toBe('unknown')
+  })
+
+  it('returns "unknown" when healthUnknown is true even if healthy is false (#5942)', () => {
+    // Backend `ListClusters` returns `{ healthUnknown: true, healthy: false }`
+    // for clusters with no probe data yet. The UI must surface these as
+    // unknown, not unhealthy.
+    expect(
+      getClusterHealthState(
+        makeCluster({
+          healthy: false,
+          healthUnknown: true,
+        }) as never,
+      ),
+    ).toBe('unknown')
+  })
+
+  it('returns "unknown" when neverConnected is true even if healthy is false (#5942)', () => {
+    expect(
+      getClusterHealthState(
+        makeCluster({
+          healthy: false,
+          neverConnected: true,
+        }) as never,
+      ),
+    ).toBe('unknown')
+  })
+
+  it('prefers neverConnected/healthUnknown over reachable=false (#5942)', () => {
+    // Stale kubeconfig contexts that have never connected should show
+    // unknown rather than unreachable, so the UI can prompt the user to
+    // remove them rather than alarming.
+    expect(
+      getClusterHealthState(
+        makeCluster({
+          healthy: false,
+          reachable: false,
+          neverConnected: true,
+        }) as never,
+      ),
+    ).toBe('unknown')
   })
 })
 

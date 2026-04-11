@@ -19,6 +19,9 @@ import (
 	"k8s.io/client-go/rest"
 
 	k8sclient "github.com/kubestellar/console/pkg/k8s"
+	"github.com/kubestellar/console/pkg/api/middleware"
+	"github.com/kubestellar/console/pkg/models"
+	"github.com/kubestellar/console/pkg/store"
 )
 
 // imageTagMaxLen is the maximum allowed length for an image tag to prevent abuse.
@@ -36,13 +39,15 @@ const selfUpgradeTimeout = 30 * time.Second
 type SelfUpgradeHandler struct {
 	k8sClient *k8sclient.MultiClusterClient
 	hub       *Hub
+	store     store.Store
 }
 
 // NewSelfUpgradeHandler creates a new SelfUpgradeHandler.
-func NewSelfUpgradeHandler(k8sClient *k8sclient.MultiClusterClient, hub *Hub) *SelfUpgradeHandler {
+func NewSelfUpgradeHandler(k8sClient *k8sclient.MultiClusterClient, hub *Hub, store store.Store) *SelfUpgradeHandler {
 	return &SelfUpgradeHandler{
 		k8sClient: k8sClient,
 		hub:       hub,
+		store:     store,
 	}
 }
 
@@ -203,6 +208,33 @@ func (h *SelfUpgradeHandler) GetStatus(c *fiber.Ctx) error {
 // TriggerUpgrade patches the Deployment image tag to trigger a rolling update.
 // POST /api/self-upgrade/trigger
 func (h *SelfUpgradeHandler) TriggerUpgrade(c *fiber.Ctx) error {
+	// SECURITY (#5409): Only admin users may trigger a self-upgrade. Without
+	// this check any authenticated user could roll the console to an arbitrary
+	// image tag using the in-cluster service account's RBAC permissions.
+	userID := middleware.GetUserID(c)
+	if h.store != nil {
+		user, err := h.store.GetUser(userID)
+		if err != nil {
+			slog.Warn("[self-upgrade] SECURITY: failed to look up user for role check",
+				"user_id", userID, "error", err)
+			return c.Status(fiber.StatusForbidden).JSON(SelfUpgradeTriggerResponse{
+				Error: "unable to verify user role — access denied",
+			})
+		}
+		if user.Role != models.UserRoleAdmin {
+			slog.Warn("[self-upgrade] SECURITY: non-admin user attempted self-upgrade",
+				"user_id", userID,
+				"github_login", middleware.GetGitHubLogin(c),
+				"role", user.Role)
+			return c.Status(fiber.StatusForbidden).JSON(SelfUpgradeTriggerResponse{
+				Error: "self-upgrade requires admin role",
+			})
+		}
+	}
+	slog.Info("[self-upgrade] admin user triggering upgrade",
+		"user_id", userID,
+		"github_login", middleware.GetGitHubLogin(c))
+
 	var req SelfUpgradeTriggerRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(SelfUpgradeTriggerResponse{
@@ -268,14 +300,27 @@ func (h *SelfUpgradeHandler) TriggerUpgrade(c *fiber.Ctx) error {
 		currentImage = dep.Spec.Template.Spec.Containers[0].Image
 	}
 
-	// Extract repository from current image (e.g., "ghcr.io/kubestellar/console:v0.3.11" → "ghcr.io/kubestellar/console")
+	// Extract repository from current image.
+	// Must handle registries with ports (e.g. "registry.internal:5000/console")
+	// where the colon is NOT a tag separator.  A tag colon always appears
+	// after the last slash, so we only strip a ":tag" suffix from the segment
+	// after the final "/".
 	repo := currentImage
-	if idx := strings.LastIndex(repo, ":"); idx > 0 {
-		repo = repo[:idx]
-	}
-	// Handle @sha256 digests
+	// Handle @sha256 digests first (e.g. "ghcr.io/console@sha256:abc123")
 	if idx := strings.LastIndex(repo, "@"); idx > 0 {
 		repo = repo[:idx]
+	}
+	// Strip tag — only look for ":" after the last "/"
+	if lastSlash := strings.LastIndex(repo, "/"); lastSlash >= 0 {
+		tail := repo[lastSlash:]
+		if colonIdx := strings.LastIndex(tail, ":"); colonIdx > 0 {
+			repo = repo[:lastSlash+colonIdx]
+		}
+	} else {
+		// No slash at all (e.g. "console:v1.0") — simple strip
+		if colonIdx := strings.LastIndex(repo, ":"); colonIdx > 0 {
+			repo = repo[:colonIdx]
+		}
 	}
 	newImage := repo + ":" + req.ImageTag
 

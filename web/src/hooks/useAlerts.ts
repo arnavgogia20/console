@@ -202,13 +202,32 @@ export function useSlackNotification() {
       }
 
       try {
-        // Note: In production, this should go through a backend proxy to avoid CORS
-        // For now, we'll just log the intended payload
-        // await fetch(webhook.webhookUrl, {
-        //   method: 'POST',
-        //   headers: { 'Content-Type': 'application/json' },
-        //   body: JSON.stringify(payload),
-        // })
+        // Route through backend notification service (#5713, Copilot followup)
+        const response = await fetch('/api/notifications/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            alert: {
+              id: alert.id,
+              ruleId: alert.ruleId || '',
+              ruleName: alert.ruleName,
+              severity: alert.severity,
+              status: alert.status,
+              message: alert.message,
+              cluster: alert.cluster,
+              resource: alert.resource,
+            },
+            channels: [{
+              type: 'slack',
+              enabled: true,
+              config: { webhookUrl: webhook.webhookUrl },
+            }],
+          }),
+        })
+        if (!response.ok) {
+          const errText = await response.text().catch(() => '')
+          throw new Error(`Notification send failed (${response.status}): ${errText}`)
+        }
         return true
       } catch (error) {
         console.error('Failed to send Slack notification:', error)

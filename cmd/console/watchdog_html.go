@@ -36,9 +36,23 @@ h1{font-size:1.25rem;font-weight:500;margin-bottom:.25rem}
 .retry-btn{display:inline-block;margin-top:1rem;padding:.4rem 1rem;background:rgba(99,102,241,.1);color:#818cf8;border:1px solid rgba(99,102,241,.25);border-radius:.5rem;font-size:.8rem;cursor:pointer;text-decoration:none;transition:all .2s}
 .retry-btn:hover{background:rgba(99,102,241,.2);border-color:rgba(99,102,241,.4)}
 
+/* Tip section (#5899) */
+.tip{margin-top:1.5rem;padding:.75rem 1rem;background:rgba(99,102,241,.05);border:1px solid rgba(99,102,241,.15);border-radius:.5rem;font-size:.75rem;color:#94a3b8;line-height:1.5;text-align:left;min-height:3rem;display:flex;align-items:center;gap:.5rem;opacity:0;animation:tipFadeIn .5s ease forwards .8s}
+.tip-label{color:#818cf8;font-weight:600;flex-shrink:0}
+.tip-text{flex:1;transition:opacity .4s ease}
+@keyframes tipFadeIn{to{opacity:1}}
+
 .stars{position:fixed;inset:0;pointer-events:none}
 .star{position:absolute;width:2px;height:2px;background:#fff;border-radius:50%;opacity:.3;animation:twinkle 3s ease-in-out infinite}
 @keyframes twinkle{0%,100%{opacity:.2}50%{opacity:.6}}
+
+/* Respect users who prefer reduced motion (#5904) */
+@media (prefers-reduced-motion: reduce){
+  .star{animation:none;opacity:.4}
+  .step.active .step-icon{animation:none;border-top-color:#6366f1}
+  .tip{animation:none;opacity:1}
+  .tip-text{transition:none}
+}
 </style>
 </head>
 <body>
@@ -56,12 +70,50 @@ h1{font-size:1.25rem;font-weight:500;margin-bottom:.25rem}
 </div>
 
 <div class="elapsed" id="elapsed"></div>
+<div class="tip" id="tip"><span class="tip-label">Tip</span><span class="tip-text" id="tip-text">Loading&hellip;</span></div>
 <a href="/" class="retry-btn" onclick="checkNow();return false;">Retry now</a>
 </div>
 
 <script>
 // Star field
 (function(){var s=document.getElementById('stars');for(var i=0;i<25;i++){var d=document.createElement('div');d.className='star';d.style.left=Math.random()*100+'%';d.style.top=Math.random()*100+'%';d.style.animationDelay=Math.random()*3+'s';s.appendChild(d)}})();
+
+// Rotating tips for the loading screen (#5899). Plain text only — uses
+// textContent to prevent XSS if tips ever become user-configurable (#5904).
+var TIPS=[
+'Press ? anywhere in the console to see all keyboard shortcuts.',
+'Use the global cluster filter at the top to scope every card to specific clusters.',
+'Right-click any resource for quick actions like logs, exec, and YAML view.',
+'Drag cards to rearrange your dashboard. Your layout auto-saves.',
+'Use Cmd/Ctrl+K to open the universal search across all clusters.',
+'The Mission sidebar lets you describe what you want — the AI will figure out the kubectl.',
+'Pin frequently-used dashboards so they appear at the top of the sidebar.',
+'Custom dashboards can mix cards from different categories. Try the Customize button.',
+'The Marketplace has 60+ CNCF project cards ready to install with one click.',
+'Demo mode (toggle in Settings) lets you explore every feature without a real cluster.',
+'Cards with a yellow border are showing demo data — connect a cluster to see real data.',
+'The Compliance card runs OPA, Kyverno, and Falco checks across all your clusters.',
+'GPU dashboards show per-namespace allocations and utilization across multi-cluster fleets.',
+'Use the AI agent picker to switch between Claude, Copilot, and other agents per mission.',
+'Saved missions are stored permanently — click any to re-run or fork as a template.'
+];
+var TIP_ROTATE_MS=8000;
+var tipTextEl=document.getElementById('tip-text');
+var tipIdx=Math.floor(Math.random()*TIPS.length);
+// Skip the fade transition entirely when the user prefers reduced motion (#5910)
+var prefersReducedMotion=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+function showTip(){
+  if(!tipTextEl)return;
+  if(prefersReducedMotion){
+    tipTextEl.textContent=TIPS[tipIdx];
+    tipIdx=(tipIdx+1)%TIPS.length;
+    return;
+  }
+  tipTextEl.style.opacity='0';
+  setTimeout(function(){tipTextEl.textContent=TIPS[tipIdx];tipTextEl.style.opacity='1';tipIdx=(tipIdx+1)%TIPS.length;},400);
+}
+showTip();
+setInterval(showTip,TIP_ROTATE_MS);
 
 var POLL_MS=2000;
 var FORCE_RELOAD_MS=120000;

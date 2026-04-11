@@ -259,6 +259,7 @@ type QueueItem struct {
 	Title             string `json:"title"`
 	Description       string `json:"description"`
 	RequestType       string `json:"request_type"`
+	TargetRepo        string `json:"target_repo,omitempty"`
 	GitHubIssueNumber int    `json:"github_issue_number"`
 	GitHubIssueURL    string `json:"github_issue_url"`
 	Status            string `json:"status"`
@@ -284,21 +285,43 @@ func (h *FeedbackHandler) ListAllFeatureRequests(c *fiber.Ctx) error {
 		currentGitHubLogin = user.GitHubLogin
 	}
 
-	// Fetch issues created by the logged-in user from GitHub
-	issues, err := h.fetchGitHubIssues(currentGitHubLogin)
+	// Fetch issues created by the logged-in user from both console and docs repos
+	consoleIssues, err := h.fetchGitHubIssuesFromRepo(currentGitHubLogin, h.repoName)
 	if err != nil {
-		slog.Error("[Feedback] failed to fetch GitHub issues", "error", err)
+		slog.Error("[Feedback] failed to fetch GitHub issues from console repo", "error", err)
 		// Fall back to local database if GitHub fetch fails
 		return h.listLocalFeatureRequests(c, userID)
 	}
 
-	// Fetch linked PRs for all issues
-	linkedPRs := h.fetchLinkedPRs(issues)
+	// Also fetch from docs repo — issues can be filed there too (#5529)
+	docsRepoName := "docs"
+	docsIssues, docsErr := h.fetchGitHubIssuesFromRepo(currentGitHubLogin, docsRepoName)
+	if docsErr != nil {
+		slog.Warn("[Feedback] failed to fetch GitHub issues from docs repo", "error", docsErr)
+		// Non-fatal — continue with console issues only
+	}
+
+	// Tag each issue with its source repo for the queue
+	type taggedIssue struct {
+		GitHubIssue
+		TargetRepo string
+	}
+	taggedIssues := make([]taggedIssue, 0, len(consoleIssues)+len(docsIssues))
+	for _, issue := range consoleIssues {
+		taggedIssues = append(taggedIssues, taggedIssue{issue, "console"})
+	}
+	for _, issue := range docsIssues {
+		taggedIssues = append(taggedIssues, taggedIssue{issue, "docs"})
+	}
+
+	// Fetch linked PRs for console issues only (docs issues use different PR workflow)
+	linkedPRs := h.fetchLinkedPRs(consoleIssues)
 
 	// Convert to queue items
 	// Note: preview URLs are fetched on-demand via CheckPreviewStatus endpoint
-	queueItems := make([]QueueItem, 0, len(issues))
-	for _, issue := range issues {
+	queueItems := make([]QueueItem, 0, len(taggedIssues))
+	for _, tagged := range taggedIssues {
+		issue := tagged.GitHubIssue
 		// Determine status based on labels
 		status := "needs_triage"
 		requestType := "feature"
@@ -365,12 +388,13 @@ func (h *FeedbackHandler) ListAllFeatureRequests(c *fiber.Ctx) error {
 		closedByUser := issue.State == "closed" && issue.ClosedBy != nil && issue.ClosedBy.Login == currentGitHubLogin
 
 		queueItems = append(queueItems, QueueItem{
-			ID:                fmt.Sprintf("gh-%d", issue.Number),
+			ID:                fmt.Sprintf("gh-%s-%d", tagged.TargetRepo, issue.Number),
 			UserID:            fmt.Sprintf("gh-%d", issue.User.ID),
 			GitHubLogin:       issue.User.Login,
 			Title:             title,
 			Description:       description,
 			RequestType:       requestType,
+			TargetRepo:        tagged.TargetRepo,
 			GitHubIssueNumber: issue.Number,
 			GitHubIssueURL:    issue.HTMLURL,
 			Status:            status,
@@ -611,9 +635,14 @@ func (h *FeedbackHandler) fetchPRPages(state string) []GitHubPR {
 	return allPRs
 }
 
-// fetchGitHubIssues fetches issues created by the given user from the configured GitHub repo
+// fetchGitHubIssues fetches issues created by the given user from the specified repo
 func (h *FeedbackHandler) fetchGitHubIssues(githubLogin string) ([]GitHubIssue, error) {
-	if h.getEffectiveToken() == "" || h.repoOwner == "" || h.repoName == "" {
+	return h.fetchGitHubIssuesFromRepo(githubLogin, h.repoName)
+}
+
+// fetchGitHubIssuesFromRepo fetches issues created by the given user from a specific repo
+func (h *FeedbackHandler) fetchGitHubIssuesFromRepo(githubLogin string, repoName string) ([]GitHubIssue, error) {
+	if h.getEffectiveToken() == "" || h.repoOwner == "" || repoName == "" {
 		return nil, fmt.Errorf("GitHub not configured")
 	}
 	if githubLogin == "" {
@@ -622,7 +651,7 @@ func (h *FeedbackHandler) fetchGitHubIssues(githubLogin string) ([]GitHubIssue, 
 
 	// Fetch all issues created by the logged-in user
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/issues?state=all&creator=%s&per_page=50&sort=updated&direction=desc",
-		h.repoOwner, h.repoName, githubLogin)
+		h.repoOwner, repoName, githubLogin)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -1042,6 +1071,14 @@ func (h *FeedbackHandler) GetNotifications(c *fiber.Ctx) error {
 	if limit > 100 {
 		limit = 100
 	}
+	// #6291: a caller passing limit<=0 previously returned 0 rows (SQLite
+	// treats LIMIT 0 as zero rows). After #6286 added clampLimit(limit)
+	// to the store, limit=0 would return 1 row instead — a silent
+	// semantic change. Treat any non-positive value as "use default" so
+	// the handler contract is preserved.
+	if limit <= 0 {
+		limit = 50
+	}
 
 	notifications, err := h.store.GetUserNotifications(userID, limit)
 	if err != nil {
@@ -1075,24 +1112,13 @@ func (h *FeedbackHandler) MarkNotificationRead(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "Invalid notification ID")
 	}
 
-	// Get notification to verify ownership
-	notifications, err := h.store.GetUserNotifications(userID, 100)
-	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "Failed to verify notification")
-	}
-
-	found := false
-	for _, n := range notifications {
-		if n.ID == notificationID {
-			found = true
-			break
+	// Mark the notification as read, verifying ownership in a single query.
+	// The store returns an error containing "not found" when the notification
+	// does not exist or is not owned by the caller.
+	if err := h.store.MarkNotificationReadByUser(notificationID, userID); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return fiber.NewError(fiber.StatusNotFound, "Notification not found")
 		}
-	}
-	if !found {
-		return fiber.NewError(fiber.StatusNotFound, "Notification not found")
-	}
-
-	if err := h.store.MarkNotificationRead(notificationID); err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "Failed to mark notification read")
 	}
 
@@ -1116,6 +1142,12 @@ func (h *FeedbackHandler) HandleGitHubWebhook(c *fiber.Ctx) error {
 	if h.webhookSecret == "" {
 		slog.Info("[Webhook] Rejected: GITHUB_WEBHOOK_SECRET not configured")
 		return fiber.NewError(fiber.StatusServiceUnavailable, "Webhook signature verification not configured")
+	}
+
+	// Reject oversized payloads early (defense-in-depth beyond Fiber's default limit)
+	const webhookMaxBodyBytes = 1 << 20 // 1 MB
+	if len(c.Body()) > webhookMaxBodyBytes {
+		return fiber.NewError(fiber.StatusRequestEntityTooLarge, "Webhook payload too large")
 	}
 
 	signature := c.Get("X-Hub-Signature-256")

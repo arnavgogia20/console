@@ -9,11 +9,12 @@
  *
  * Caps at MAX_CACHED routes to bound memory. Least-recently-used eviction.
  */
-import { Suspense, useRef } from 'react'
+import { Suspense, useRef, useEffect } from 'react'
 import { useLocation, useOutlet } from 'react-router-dom'
 import { ContentLoadingSkeleton } from './Layout'
 import { ChunkErrorBoundary } from '../ChunkErrorBoundary'
 import { PageErrorBoundary } from '../PageErrorBoundary'
+import { KeepAliveActiveContext } from '../../hooks/useKeepAliveActive'
 
 const MAX_CACHED = 8
 
@@ -56,15 +57,17 @@ export function KeepAliveOutlet() {
     }
   }
 
-  // Trigger re-render on window resize so hidden charts can recalculate
-  const triggerResizeOnActivation = (path: string) => {
-    if (path === currentPath) {
-      // Small delay to let display:contents take effect before dispatching resize
+  // Trigger resize once when the active route changes so hidden charts can recalculate (#5710).
+  // Using useEffect instead of an inline ref callback to avoid re-dispatching on every render.
+  const lastResizedPathRef = useRef<string>('')
+  useEffect(() => {
+    if (currentPath && currentPath !== lastResizedPathRef.current) {
+      lastResizedPathRef.current = currentPath
       requestAnimationFrame(() => {
         window.dispatchEvent(new Event('resize'))
       })
     }
-  }
+  }, [currentPath])
 
   // Build the rendered output — all cached routes, only active one visible
   const entries = (() => {
@@ -84,15 +87,16 @@ export function KeepAliveOutlet() {
           data-keepalive-route={path}
           data-keepalive-active={active ? 'true' : 'false'}
           style={{ display: active ? 'contents' : 'none' }}
-          ref={active ? () => triggerResizeOnActivation(path) : undefined}
         >
-          <ChunkErrorBoundary>
-            <PageErrorBoundary>
-              <Suspense fallback={<ContentLoadingSkeleton />}>
-                {element}
-              </Suspense>
-            </PageErrorBoundary>
-          </ChunkErrorBoundary>
+          <KeepAliveActiveContext.Provider value={active}>
+            <ChunkErrorBoundary>
+              <PageErrorBoundary>
+                <Suspense fallback={<ContentLoadingSkeleton />}>
+                  {element}
+                </Suspense>
+              </PageErrorBoundary>
+            </ChunkErrorBoundary>
+          </KeepAliveActiveContext.Provider>
         </div>
       ))}
     </>

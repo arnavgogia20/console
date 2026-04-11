@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"log/slog"
-	"sort"
 	"sync"
 
 	"github.com/gofiber/fiber/v2"
@@ -46,6 +45,13 @@ func (h *MCPHandlers) ListClusters(c *fiber.Ctx) error {
 				clusters[i].Healthy = health.Healthy
 				clusters[i].NodeCount = health.NodeCount
 				clusters[i].PodCount = health.PodCount
+				// Surface the stale-kubeconfig signal: a cluster that has
+				// a health cache entry but has never been successfully
+				// reached (empty LastSeen) drives the "never connected"
+				// warning banner in the Clusters page (#5921).
+				if !health.Reachable && health.LastSeen == "" {
+					clusters[i].NeverConnected = true
+				}
 			} else {
 				// No health data collected yet (e.g. immediately after boot).
 				// Signal "initializing" rather than falsely reporting Unhealthy.
@@ -274,10 +280,10 @@ func (h *MCPHandlers) GetEvents(c *fiber.Ctx) error {
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
 
-			// Sort by timestamp (most recent first) and limit total
-			sort.Slice(allEvents, func(i, j int) bool {
-				return allEvents[i].LastSeen > allEvents[j].LastSeen
-			})
+			// Sort by LastSeen parsed as time (most recent first).
+			// Lexicographic string compare is unreliable across timezones
+			// and empty values (see issue #6043).
+			k8s.SortEventsByLastSeenDesc(allEvents)
 			if len(allEvents) > limit {
 				allEvents = allEvents[:limit]
 			}
@@ -377,10 +383,10 @@ func (h *MCPHandlers) GetWarningEvents(c *fiber.Ctx) error {
 
 			waitWithDeadline(&wg, clusterCancel, maxResponseDeadline)
 
-			// Sort by timestamp (most recent first) and limit total
-			sort.Slice(allEvents, func(i, j int) bool {
-				return allEvents[i].LastSeen > allEvents[j].LastSeen
-			})
+			// Sort by LastSeen parsed as time (most recent first).
+			// Lexicographic string compare is unreliable across timezones
+			// and empty values (see issue #6043).
+			k8s.SortEventsByLastSeenDesc(allEvents)
 			if len(allEvents) > limit {
 				allEvents = allEvents[:limit]
 			}

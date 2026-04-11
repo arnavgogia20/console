@@ -1,6 +1,42 @@
 import { ClusterInfo } from '../../hooks/useMCP'
 import { safeGetItem, safeSetItem } from '../../lib/utils/localStorage'
 
+/**
+ * Canonical cluster health states surfaced by the shared helper.
+ *
+ * Priority (first match wins):
+ * 1. `neverConnected` → `unknown`  (never produced a successful probe)
+ * 2. `healthUnknown`  → `unknown`  (no probe has returned yet)
+ * 3. unreachable      → `unreachable`
+ * 4. `healthy === true`  → `healthy`
+ * 5. `healthy === false` → `unhealthy`
+ * 6. fallback         → `loading` or `unknown`
+ *
+ * - `healthy`    — backend reports healthy=true
+ * - `unhealthy`  — backend reports healthy=false AND no higher-priority
+ *                  signal (healthUnknown/neverConnected) is set
+ * - `unreachable`— reachable=false or an unreachable errorType
+ * - `loading`    — `healthy` is undefined AND one of:
+ *                    (a) an explicit refresh is in progress
+ *                        (`refreshing===true`) and `nodeCount` is either
+ *                        undefined or 0 (no cached node data to show), OR
+ *                    (b) no probe has completed yet — both `nodeCount`
+ *                        and `reachable` are undefined (initial load).
+ *                  An explicit refresh on a cluster that already has
+ *                  cached node data (`nodeCount > 0`) does NOT return
+ *                  loading; it returns the cached state.
+ * - `unknown`    — no authoritative health signal (no successful probe
+ *                  yet or `healthUnknown`/`neverConnected` from backend)
+ *
+ * See #5923, #5924, #5928, #5942 for the history behind these states.
+ */
+export type ClusterHealthState =
+  | 'healthy'
+  | 'unhealthy'
+  | 'unreachable'
+  | 'loading'
+  | 'unknown'
+
 // Helper to determine if cluster is unreachable vs just unhealthy
 // IMPORTANT: Only mark as unreachable with CORROBORATED evidence
 // The useMCP hook only sets reachable=false after 5 minutes of consecutive failures
@@ -14,12 +50,46 @@ export const isClusterUnreachable = (c: ClusterInfo): boolean => {
   return false
 }
 
-// Helper to check if a cluster is healthy.
-// A cluster is healthy if its healthy flag is true OR it has nodes reporting in.
-// This single definition is used by both the stats overview counts and the filter
-// tabs so that clicking a stat always shows exactly the clusters it counted.
+/**
+ * Centralised cluster-health state machine (#5928).
+ *
+ * This is the single source of truth for cluster health across the whole
+ * UI. Every component that needs to decide between healthy / unhealthy /
+ * loading / unknown / unreachable MUST use this helper so that badges,
+ * counts, and status indicators never disagree (#5920).
+ */
+export const getClusterHealthState = (c: ClusterInfo): ClusterHealthState => {
+  // Priority order matters here — see #5942. The backend sets
+  // `healthy: false` together with `healthUnknown: true` / `neverConnected: true`
+  // for clusters that have never successfully reported health. We must
+  // surface those as `unknown`, not as `unhealthy`, so the UI doesn't
+  // alarm on clusters we've simply never heard from.
+  if (c.neverConnected === true) return 'unknown'
+  if (c.healthUnknown === true) return 'unknown'
+  if (isClusterUnreachable(c)) return 'unreachable'
+  if (c.healthy === true) return 'healthy'
+  if (c.healthy === false) return 'unhealthy'
+  // Health is undefined. Prefer a distinct `loading` state when we're
+  // actively refreshing and have no cached node data (#5924).
+  if (c.refreshing === true && (c.nodeCount === undefined || c.nodeCount === 0)) {
+    return 'loading'
+  }
+  if (c.nodeCount === undefined && c.reachable === undefined) {
+    return 'loading'
+  }
+  // No authoritative health signal — surface as unknown rather than
+  // silently defaulting to healthy (#5923).
+  return 'unknown'
+}
+
+/**
+ * Backwards-compatible boolean helper used by stats counts and filter
+ * tabs. Returns true only when the state machine reports `healthy`.
+ * Previously this helper defaulted to true when health was unknown and
+ * nodes were present; that was the bug behind #5923.
+ */
 export const isClusterHealthy = (c: ClusterInfo): boolean => {
-  return c.healthy === true || !!(c.nodeCount && c.nodeCount > 0)
+  return getClusterHealthState(c) === 'healthy'
 }
 
 // Helper to check if cluster has token/auth expired error

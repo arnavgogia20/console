@@ -69,7 +69,8 @@ type MetricsHistory struct {
 	mu                 sync.RWMutex
 	stopCh             chan struct{}
 	dataDir            string
-	loggedClusterError bool // suppress repeated "no kubeconfig" errors
+	loggedClusterError bool  // suppress repeated "no kubeconfig" errors
+	lastPersistError   error // last saveToDisk error, nil on success (#5553)
 }
 
 // NewMetricsHistory creates a new metrics history manager
@@ -246,7 +247,7 @@ func (mh *MetricsHistory) captureSnapshot() error {
 	trimmed := make([]MetricsSnapshot, 0, len(mh.snapshots))
 	for _, s := range mh.snapshots {
 		ts, err := time.Parse(time.RFC3339, s.Timestamp)
-		if err != nil || ts.After(cutoff) {
+		if err == nil && ts.After(cutoff) {
 			trimmed = append(trimmed, s)
 		}
 	}
@@ -267,7 +268,7 @@ func (mh *MetricsHistory) captureSnapshot() error {
 	return nil
 }
 
-// saveToDisk persists history to disk
+// saveToDisk persists history to disk and tracks the last error for health checks (#5553).
 func (mh *MetricsHistory) saveToDisk() {
 	mh.mu.RLock()
 	data, err := json.Marshal(mh.snapshots)
@@ -275,19 +276,40 @@ func (mh *MetricsHistory) saveToDisk() {
 
 	if err != nil {
 		slog.Error("[MetricsHistory] error marshaling history", "error", err)
+		mh.mu.Lock()
+		mh.lastPersistError = err
+		mh.mu.Unlock()
 		return
 	}
 
 	// Ensure directory exists
 	if err := os.MkdirAll(mh.dataDir, metricsDirMode); err != nil {
 		slog.Error("[MetricsHistory] error creating data dir", "error", err)
+		mh.mu.Lock()
+		mh.lastPersistError = err
+		mh.mu.Unlock()
 		return
 	}
 
 	filePath := filepath.Join(mh.dataDir, metricsHistoryFile)
 	if err := os.WriteFile(filePath, data, metricsFileMode); err != nil {
 		slog.Error("[MetricsHistory] error writing history file", "error", err)
+		mh.mu.Lock()
+		mh.lastPersistError = err
+		mh.mu.Unlock()
+		return
 	}
+
+	mh.mu.Lock()
+	mh.lastPersistError = nil
+	mh.mu.Unlock()
+}
+
+// LastPersistError returns the last saveToDisk error, or nil if persistence is healthy.
+func (mh *MetricsHistory) LastPersistError() error {
+	mh.mu.RLock()
+	defer mh.mu.RUnlock()
+	return mh.lastPersistError
 }
 
 // loadFromDisk loads history from disk
@@ -313,7 +335,7 @@ func (mh *MetricsHistory) loadFromDisk() {
 	filtered := make([]MetricsSnapshot, 0)
 	for _, s := range snapshots {
 		ts, err := time.Parse(time.RFC3339, s.Timestamp)
-		if err != nil || ts.After(cutoff) {
+		if err == nil && ts.After(cutoff) {
 			filtered = append(filtered, s)
 		}
 	}
